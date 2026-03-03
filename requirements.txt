@@ -3,5 +3,5 @@ pandas
 numpy
 plotly
 yfinance
-FinanceDataReader
+finance-datareader
 pykrx
