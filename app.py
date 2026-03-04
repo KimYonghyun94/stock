@@ -80,11 +80,10 @@ def annualized_vol(close: pd.Series, window: int = 20, ann: int = 252) -> pd.Ser
     return close.pct_change().rolling(window).std() * np.sqrt(ann)
 
 # ============================================================
-# Data fetch
+# Data fetch - Korea
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def krx_listing():
-    """KRX listing for name search (FinanceDataReader)."""
     if not FDR_OK:
         return None
     try:
@@ -93,7 +92,6 @@ def krx_listing():
         return None
 
 def infer_yahoo_suffix(code6: str, listing_df: pd.DataFrame | None):
-    """Heuristic: KOSPI .KS, KOSDAQ .KQ"""
     if listing_df is None:
         return ".KS"
     hit = listing_df[listing_df["Symbol"].astype(str) == str(code6)]
@@ -101,91 +99,6 @@ def infer_yahoo_suffix(code6: str, listing_df: pd.DataFrame | None):
         return ".KS"
     market = str(hit.iloc[0].get("Market", "")).upper()
     return ".KQ" if "KOSDAQ" in market else ".KS"
-
-@st.cache_data(ttl=300, show_spinner=False)  # 실패 결과가 오래 캐시되지 않게 5분
-def fetch_stooq_us_daily_csv(ticker: str, start: date, end: date):
-    """
-    US via Stooq direct CSV with headers + domain fallback.
-    Returns: (df, meta)
-    """
-    # BRK-B -> BRK.B 같은 케이스 대비
-    sym = ticker.strip().upper().replace("-", ".")
-    if not sym.endswith(".US"):
-        sym = f"{sym}.US"
-
-    bases = ["https://stooq.com", "https://stooq.pl"]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; StockApp/1.0; +https://example.com)",
-        "Accept": "text/csv,text/plain;q=0.9,*/*;q=0.8",
-    }
-
-    attempts = []
-    start_ts = pd.to_datetime(start)
-    end_ts = pd.to_datetime(end)
-
-    for base in bases:
-        url = f"{base}/q/d/l/?s={sym}&i=d"
-        try:
-            r = requests.get(url, headers=headers, timeout=20)
-            head = (r.text or "")[:120].replace("\n", "\\n")
-            attempts.append(f"{url} -> status={r.status_code}, head={head}")
-
-            if r.status_code != 200:
-                continue
-
-            text = (r.text or "").lstrip()
-            # CSV 여부 체크
-            if not text.startswith("Date,Open,High,Low,Close"):
-                continue
-
-            df = pd.read_csv(StringIO(text))
-            if df is None or df.empty or "Date" not in df.columns:
-                continue
-
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-
-            need = {"Open", "High", "Low", "Close"}
-            if not need.issubset(df.columns):
-                continue
-            if "Volume" not in df.columns:
-                df["Volume"] = 0
-
-            df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
-            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-
-            meta = {"ok": True, "used_url": url, "attempts": attempts[-3:]}
-            return df, meta
-
-        except Exception as e:
-            attempts.append(f"{url} -> EXCEPTION: {type(e).__name__}: {e}")
-
-    return pd.DataFrame(), {"ok": False, "attempts": attempts}
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yfinance_daily(symbol: str, start: date, end: date, auto_adjust: bool = True) -> pd.DataFrame:
-    """Daily OHLCV via yfinance (may rate-limit on Streamlit Cloud)."""
-    if not YF_OK:
-        return pd.DataFrame()
-    try:
-        sink = io.StringIO()
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            df = yf.download(
-                symbol,
-                start=str(start),
-                end=str(end + timedelta(days=1)),
-                interval="1d",
-                auto_adjust=auto_adjust,
-                progress=False,
-                threads=True,
-            )
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.rename_axis("Date")
-        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-        return df[keep].dropna()
-    except Exception:
-        return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fdr_korea_daily(code6: str, start: date, end: date) -> pd.DataFrame:
@@ -220,16 +133,171 @@ def fetch_pykrx_daily(code6: str, start: date, end: date, adjusted: bool = True)
     except Exception:
         return pd.DataFrame()
 
+# ============================================================
+# Data fetch - US (Stooq / AlphaVantage / yfinance / upload)
+# ============================================================
+@st.cache_data(ttl=300, show_spinner=False)  # 실패 캐시 짧게
+def fetch_stooq_us_daily_csv(ticker: str, start: date, end: date):
+    """
+    Stooq direct CSV with domain fallback.
+    Returns: (df, meta)
+    """
+    sym = ticker.strip().upper().replace("-", ".")
+    if not sym.endswith(".US"):
+        sym = f"{sym}.US"
+
+    bases = ["https://stooq.com", "https://stooq.pl"]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; StockApp/1.0)",
+        "Accept": "text/csv,text/plain;q=0.9,*/*;q=0.8",
+    }
+
+    attempts = []
+    start_ts = pd.to_datetime(start)
+    end_ts = pd.to_datetime(end)
+
+    for base in bases:
+        url = f"{base}/q/d/l/?s={sym}&i=d"
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            head = (r.text or "")[:120].replace("\n", "\\n")
+            attempts.append(f"{url} -> status={r.status_code}, head={head}")
+
+            if r.status_code != 200:
+                continue
+
+            text = (r.text or "").lstrip()
+            if not text.startswith("Date,Open,High,Low,Close"):
+                # 여기서 "Exceeded the daily hits limit" 같은 메시지가 걸림
+                continue
+
+            df = pd.read_csv(StringIO(text))
+            if df is None or df.empty or "Date" not in df.columns:
+                continue
+
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+
+            need = {"Open", "High", "Low", "Close"}
+            if not need.issubset(df.columns):
+                continue
+            if "Volume" not in df.columns:
+                df["Volume"] = 0
+
+            df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+            return df, {"ok": True, "used_url": url, "attempts": attempts[-3:]}
+        except Exception as e:
+            attempts.append(f"{url} -> EXCEPTION: {type(e).__name__}: {e}")
+
+    return pd.DataFrame(), {"ok": False, "attempts": attempts}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_alphavantage_daily(symbol: str, start: date, end: date, api_key: str):
+    """
+    Alpha Vantage daily data.
+    Returns: (df, meta)
+    """
+    base = "https://www.alphavantage.co/query"
+    params_list = [
+        # adjusted 먼저 시도
+        {"function": "TIME_SERIES_DAILY_ADJUSTED", "symbol": symbol, "outputsize": "full", "apikey": api_key},
+        # 안 되면 unadjusted
+        {"function": "TIME_SERIES_DAILY", "symbol": symbol, "outputsize": "full", "apikey": api_key},
+    ]
+
+    attempts = []
+    start_ts = pd.to_datetime(start)
+    end_ts = pd.to_datetime(end)
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; StockApp/1.0)"}
+
+    for p in params_list:
+        try:
+            r = requests.get(base, params=p, headers=headers, timeout=25)
+            attempts.append(f"{p['function']} -> status={r.status_code}")
+            if r.status_code != 200:
+                continue
+
+            js = r.json()
+            # rate limit / note
+            if isinstance(js, dict) and ("Note" in js or "Information" in js):
+                return pd.DataFrame(), {"ok": False, "provider": "alphavantage", "note": js.get("Note") or js.get("Information"), "attempts": attempts}
+
+            # time series key 탐색
+            ts_key = None
+            for k in js.keys() if isinstance(js, dict) else []:
+                if "Time Series" in k:
+                    ts_key = k
+                    break
+            if not ts_key:
+                return pd.DataFrame(), {"ok": False, "provider": "alphavantage", "raw_keys": list(js.keys())[:10] if isinstance(js, dict) else None, "attempts": attempts}
+
+            ts = js[ts_key]
+            if not isinstance(ts, dict) or len(ts) == 0:
+                continue
+
+            rows = []
+            for dstr, v in ts.items():
+                # v keys: "1. open", "2. high", ...
+                rows.append({
+                    "Date": dstr,
+                    "Open": float(v.get("1. open", np.nan)),
+                    "High": float(v.get("2. high", np.nan)),
+                    "Low": float(v.get("3. low", np.nan)),
+                    "Close": float(v.get("4. close", np.nan)),
+                    "Volume": float(v.get("6. volume", v.get("5. volume", np.nan))),
+                })
+
+            df = pd.DataFrame(rows)
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+            df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            if df.empty:
+                continue
+
+            return df, {"ok": True, "provider": "alphavantage", "function": p["function"], "attempts": attempts}
+        except Exception as e:
+            attempts.append(f"{p['function']} -> EXCEPTION: {type(e).__name__}: {e}")
+
+    return pd.DataFrame(), {"ok": False, "provider": "alphavantage", "attempts": attempts}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yfinance_daily(symbol: str, start: date, end: date, auto_adjust: bool = True) -> pd.DataFrame:
+    if not YF_OK:
+        return pd.DataFrame()
+    try:
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            df = yf.download(
+                symbol,
+                start=str(start),
+                end=str(end + timedelta(days=1)),
+                interval="1d",
+                auto_adjust=auto_adjust,
+                progress=False,
+                threads=True,
+            )
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.rename_axis("Date")
+        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        return df[keep].dropna()
+    except Exception:
+        return pd.DataFrame()
+
 def ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy().sort_index()
-    needed = {"Open","High","Low","Close"}
+    needed = {"Open", "High", "Low", "Close"}
     if not needed.issubset(df.columns):
         return pd.DataFrame()
     if "Volume" not in df.columns:
         df["Volume"] = 0
-    return df.dropna(subset=["Open","High","Low","Close"])
+    return df.dropna(subset=["Open", "High", "Low", "Close"])
 
 # ============================================================
 # Backtest engine (long/flat, close-to-close simplified)
@@ -237,7 +305,6 @@ def ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 def positions_to_trades(close: pd.Series, pos: pd.Series) -> pd.DataFrame:
     pos = pos.fillna(0).astype(float)
     d = pos.diff().fillna(pos)
-
     entries = d[d > 0].index
     exits = d[d < 0].index
 
@@ -306,7 +373,7 @@ def run_backtest(df: pd.DataFrame, pos: pd.Series, fee_bps: float = 5.0, slippag
     ret = close.pct_change().fillna(0.0)
 
     pos = pos.reindex(df.index).fillna(0.0).astype(float)
-    held = pos.shift(1).fillna(0.0)  # avoid look-ahead
+    held = pos.shift(1).fillna(0.0)
 
     gross = held * ret
     dpos = pos.diff().fillna(pos)
@@ -321,7 +388,7 @@ def run_backtest(df: pd.DataFrame, pos: pd.Series, fee_bps: float = 5.0, slippag
     return equity, strat_ret, trades, metrics
 
 # ============================================================
-# Strategies (long/flat)
+# Strategies
 # ============================================================
 def strat_buyhold(df, **params):
     return pd.Series(1.0, index=df.index)
@@ -329,10 +396,6 @@ def strat_buyhold(df, **params):
 def strat_sma_cross(df, fast=20, slow=60, **params):
     c = df["Close"].astype(float)
     return (sma(c, fast) > sma(c, slow)).astype(float)
-
-def strat_ema_cross(df, fast=12, slow=26, **params):
-    c = df["Close"].astype(float)
-    return (ema(c, fast) > ema(c, slow)).astype(float)
 
 def strat_macd_trend(df, fast=12, slow=26, signal=9, **params):
     c = df["Close"].astype(float)
@@ -355,134 +418,30 @@ def strat_rsi_reversion(df, n=14, low=30, high=70, **params):
         pos.loc[t] = float(in_pos)
     return pos
 
-def strat_bollinger_reversion(df, n=20, k=2.0, **params):
-    c = df["Close"].astype(float)
-    mid, up, lo = bollinger(c, n, k)
-    entry = (c < lo).astype(int)
-    exit_ = (c > mid).astype(int)
-
-    pos = pd.Series(0, index=df.index, dtype=float)
-    in_pos = 0
-    for t in df.index:
-        if in_pos == 0 and entry.loc[t] == 1:
-            in_pos = 1
-        elif in_pos == 1 and exit_.loc[t] == 1:
-            in_pos = 0
-        pos.loc[t] = float(in_pos)
-    return pos
-
-def strat_donchian_breakout(df, n=20, **params):
-    h = df["High"].astype(float)
-    l = df["Low"].astype(float)
-    c = df["Close"].astype(float)
-    up, dn = donchian(h, l, n)
-
-    entry = (c > up.shift(1)).astype(int)
-    exit_ = (c < dn.shift(1)).astype(int)
-
-    pos = pd.Series(0, index=df.index, dtype=float)
-    in_pos = 0
-    for t in df.index:
-        if in_pos == 0 and entry.loc[t] == 1:
-            in_pos = 1
-        elif in_pos == 1 and exit_.loc[t] == 1:
-            in_pos = 0
-        pos.loc[t] = float(in_pos)
-    return pos
-
-def strat_momentum_filter(df, lookback=120, sma_filter=200, **params):
-    c = df["Close"].astype(float)
-    mom = c / c.shift(lookback) - 1.0
-    filt = c > sma(c, sma_filter)
-    return ((mom > 0) & filt).astype(float)
-
-def strat_trend_vol_cap(df, fast=20, slow=60, vol_window=20, vol_cap=0.30, **params):
-    c = df["Close"].astype(float)
-    signal = sma(c, fast) > sma(c, slow)
-    vol = annualized_vol(c, window=vol_window)
-    return (signal & (vol <= vol_cap)).astype(float)
-
 STRATEGY_SPECS = {
-    "Buy & Hold": {
-        "fn": strat_buyhold,
-        "desc": "항상 보유(기준선).",
-        "params": [],
-        "defaults": {}
-    },
+    "Buy & Hold": {"fn": strat_buyhold, "desc": "항상 보유(기준선).", "params": []},
     "SMA Crossover": {
-        "fn": strat_sma_cross,
-        "desc": "FAST SMA > SLOW SMA일 때 보유(추세).",
+        "fn": strat_sma_cross, "desc": "FAST SMA > SLOW SMA일 때 보유.",
         "params": [
             dict(name="fast", label="FAST SMA", kind="int", min=5, max=200, step=1, default=20),
             dict(name="slow", label="SLOW SMA", kind="int", min=10, max=400, step=1, default=60),
         ],
-        "defaults": {"fast": 20, "slow": 60}
-    },
-    "EMA Crossover": {
-        "fn": strat_ema_cross,
-        "desc": "FAST EMA > SLOW EMA일 때 보유(추세).",
-        "params": [
-            dict(name="fast", label="FAST EMA", kind="int", min=3, max=100, step=1, default=12),
-            dict(name="slow", label="SLOW EMA", kind="int", min=5, max=200, step=1, default=26),
-        ],
-        "defaults": {"fast": 12, "slow": 26}
     },
     "MACD Trend": {
-        "fn": strat_macd_trend,
-        "desc": "MACD > Signal일 때 보유(추세).",
+        "fn": strat_macd_trend, "desc": "MACD > Signal일 때 보유.",
         "params": [
             dict(name="fast", label="MACD fast EMA", kind="int", min=3, max=50, step=1, default=12),
             dict(name="slow", label="MACD slow EMA", kind="int", min=10, max=120, step=1, default=26),
             dict(name="signal", label="Signal EMA", kind="int", min=3, max=30, step=1, default=9),
         ],
-        "defaults": {"fast": 12, "slow": 26, "signal": 9}
     },
     "RSI Mean Reversion": {
-        "fn": strat_rsi_reversion,
-        "desc": "RSI LOW 아래 진입, HIGH 위 청산(역추세).",
+        "fn": strat_rsi_reversion, "desc": "RSI 낮으면 진입, 높으면 청산(역추세).",
         "params": [
             dict(name="n", label="RSI period", kind="int", min=5, max=50, step=1, default=14),
             dict(name="low", label="Entry (oversold)", kind="int", min=5, max=45, step=1, default=30),
             dict(name="high", label="Exit (overbought)", kind="int", min=55, max=95, step=1, default=70),
         ],
-        "defaults": {"n": 14, "low": 30, "high": 70}
-    },
-    "Bollinger Mean Reversion": {
-        "fn": strat_bollinger_reversion,
-        "desc": "하단 밴드 이탈 진입, 중단 회귀 청산.",
-        "params": [
-            dict(name="n", label="BB period", kind="int", min=5, max=60, step=1, default=20),
-            dict(name="k", label="Std multiplier (k)", kind="float", min=1.0, max=4.0, step=0.1, default=2.0),
-        ],
-        "defaults": {"n": 20, "k": 2.0}
-    },
-    "Donchian Breakout": {
-        "fn": strat_donchian_breakout,
-        "desc": "채널 상단 돌파 진입, 하단 이탈 청산.",
-        "params": [
-            dict(name="n", label="Donchian window", kind="int", min=5, max=120, step=1, default=20),
-        ],
-        "defaults": {"n": 20}
-    },
-    "Momentum + SMA Filter": {
-        "fn": strat_momentum_filter,
-        "desc": "모멘텀>0 & 가격>SMA(filter)일 때 보유.",
-        "params": [
-            dict(name="lookback", label="Momentum lookback", kind="int", min=20, max=300, step=5, default=120),
-            dict(name="sma_filter", label="SMA filter", kind="int", min=50, max=300, step=10, default=200),
-        ],
-        "defaults": {"lookback": 120, "sma_filter": 200}
-    },
-    "Trend + Vol Cap": {
-        "fn": strat_trend_vol_cap,
-        "desc": "추세 신호 + 변동성 상한 넘으면 risk-off.",
-        "params": [
-            dict(name="fast", label="FAST SMA", kind="int", min=5, max=200, step=1, default=20),
-            dict(name="slow", label="SLOW SMA", kind="int", min=10, max=400, step=1, default=60),
-            dict(name="vol_window", label="Vol window", kind="int", min=10, max=120, step=5, default=20),
-            dict(name="vol_cap", label="Vol cap (ann.)", kind="float", min=0.10, max=1.00, step=0.01, default=0.30),
-        ],
-        "defaults": {"fast": 20, "slow": 60, "vol_window": 20, "vol_cap": 0.30}
     },
 }
 
@@ -491,13 +450,9 @@ def build_params_ui(strategy_name: str):
     params = {}
     for p in spec["params"]:
         if p["kind"] == "int":
-            params[p["name"]] = st.slider(
-                p["label"], int(p["min"]), int(p["max"]), int(p["default"]), int(p["step"])
-            )
+            params[p["name"]] = st.slider(p["label"], int(p["min"]), int(p["max"]), int(p["default"]), int(p["step"]))
         else:
-            params[p["name"]] = st.slider(
-                p["label"], float(p["min"]), float(p["max"]), float(p["default"]), float(p["step"])
-            )
+            params[p["name"]] = st.slider(p["label"], float(p["min"]), float(p["max"]), float(p["default"]), float(p["step"]))
     return params
 
 # ============================================================
@@ -507,26 +462,17 @@ def plot_price_with_signals(df: pd.DataFrame, pos: pd.Series, title: str):
     c = df["Close"].astype(float)
     pos = pos.reindex(df.index).fillna(0.0)
     d = pos.diff().fillna(pos)
-
     entries = d[d > 0].index
     exits = d[d < 0].index
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.index, y=c, mode="lines", name="Close"))
-
     if len(entries) > 0:
-        fig.add_trace(go.Scatter(
-            x=entries, y=c.loc[entries],
-            mode="markers", name="Entry",
-            marker=dict(symbol="triangle-up", size=10)
-        ))
+        fig.add_trace(go.Scatter(x=entries, y=c.loc[entries], mode="markers", name="Entry",
+                                 marker=dict(symbol="triangle-up", size=10)))
     if len(exits) > 0:
-        fig.add_trace(go.Scatter(
-            x=exits, y=c.loc[exits],
-            mode="markers", name="Exit",
-            marker=dict(symbol="triangle-down", size=10)
-        ))
-
+        fig.add_trace(go.Scatter(x=exits, y=c.loc[exits], mode="markers", name="Exit",
+                                 marker=dict(symbol="triangle-down", size=10)))
     fig.update_layout(title=title, height=520, xaxis_title="Date", yaxis_title="Price")
     return fig
 
@@ -557,25 +503,20 @@ with st.sidebar:
         st.success("Cache cleared")
 
     st.divider()
-    st.header("Data")
+    st.header("Market")
     market = st.selectbox("Market", ["US (미국)", "Korea (한국)"])
 
     today = date.today()
     start_default = today - timedelta(days=365 * 3)
     date_range = st.date_input("Date Range", value=[start_default, today], max_value=today)
-
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         start_d, end_d = date_range
     else:
         st.warning("날짜 범위를 시작/끝 2개 모두 선택해주세요.")
         st.stop()
 
-    if start_d > end_d:
-        st.error("Start date must be <= end date.")
-        st.stop()
-
     st.divider()
-    st.header("Backtest Assumptions")
+    st.header("Assumptions")
     fee_bps = st.number_input("Fee (bps per trade)", 0.0, 200.0, 5.0, 1.0)
     slip_bps = st.number_input("Slippage (bps per trade)", 0.0, 200.0, 0.0, 1.0)
 
@@ -583,15 +524,26 @@ with st.sidebar:
     mode = st.radio("Mode", ["Single Strategy", "Compare Strategies"], index=0)
 
     st.divider()
-    st.header("Symbol")
+    st.header("Symbol / Source")
 
     listing_df = krx_listing() if market.startswith("Korea") else None
 
     if market.startswith("US"):
         us_ticker = st.text_input("US Ticker (e.g., AAPL, MSFT, NVDA, BRK-B)", value="AAPL").strip()
+        us_source = st.selectbox("US Data Source", ["Alpha Vantage (API key)", "Stooq (free, quota)", "yfinance (may rate-limit)", "Upload CSV"])
         show_us_debug = st.checkbox("Show US fetch debug", value=True)
-        use_yf_fallback = st.checkbox("If Stooq fails, try yfinance (may rate limit)", value=False)
+
+        # Alpha Vantage key
+        av_key = st.secrets.get("ALPHAVANTAGE_API_KEY", "").strip()
+
+        # yfinance options
         yf_auto_adj = st.checkbox("yfinance auto-adjust", value=True)
+
+        # upload
+        up = None
+        if us_source == "Upload CSV":
+            up = st.file_uploader("Upload CSV (Date,Open,High,Low,Close,Volume)", type=["csv"])
+
     else:
         sources = []
         if PYKRX_OK: sources.append("pykrx (KRX)")
@@ -605,7 +557,6 @@ with st.sidebar:
         kr_code6 = st.text_input("KRX Code (6 digits, e.g., 005930)", value="005930").strip()
         name_q = st.text_input("Search by Name (optional)", value="").strip()
         chosen_name = None
-
         if listing_df is not None and name_q:
             hits = listing_df[listing_df["Name"].astype(str).str.contains(name_q, na=False)].head(30)
             if len(hits) > 0:
@@ -627,7 +578,7 @@ with st.sidebar:
     else:
         default_sel = ["Buy & Hold", "SMA Crossover", "MACD Trend", "RSI Mean Reversion"]
         selected = st.multiselect("Select strategies to compare", list(STRATEGY_SPECS.keys()), default=default_sel)
-        st.caption("Compare 모드는 각 전략의 Default 파라미터로 비교합니다.")
+        st.caption("Compare 모드는 각 전략 기본 파라미터로 비교합니다.")
 
     st.divider()
     run = st.button("Run Backtest", type="primary")
@@ -635,62 +586,84 @@ with st.sidebar:
 def load_data():
     if market.startswith("US"):
         ticker = us_ticker.upper().strip()
-        df, meta = fetch_stooq_us_daily_csv(ticker, start_d, end_d)
-        src = "stooq(csv)"
 
-        # debug (optional)
-        if show_us_debug:
-            with st.expander("US fetch debug (Stooq)"):
-                st.write(meta)
+        # 1) Alpha Vantage
+        if us_source.startswith("Alpha Vantage"):
+            if not av_key:
+                return pd.DataFrame(), "Alpha Vantage key missing (set ALPHAVANTAGE_API_KEY in secrets)."
+            df, meta = fetch_alphavantage_daily(ticker, start_d, end_d, av_key)
+            if show_us_debug:
+                with st.expander("US debug (Alpha Vantage)"):
+                    st.write(meta)
+            title = f"{ticker} (US) — source=alphavantage"
+            return df, title
 
-        # optional yfinance fallback
-        if df.empty and use_yf_fallback and YF_OK:
-            st.warning("Stooq 실패 → yfinance fallback 시도 중… (레이트리밋 가능)")
-            df2 = fetch_yfinance_daily(ticker, start_d, end_d, auto_adjust=yf_auto_adj)
-            if not df2.empty:
-                df, src = df2, "yfinance"
-        title = f"{ticker} (US) — source={src}"
-        return df, title
+        # 2) Stooq
+        if us_source.startswith("Stooq"):
+            df, meta = fetch_stooq_us_daily_csv(ticker, start_d, end_d)
+            if show_us_debug:
+                with st.expander("US debug (Stooq)"):
+                    st.write(meta)
+            title = f"{ticker} (US) — source=stooq"
+            return df, title
+
+        # 3) yfinance
+        if us_source.startswith("yfinance"):
+            df = fetch_yfinance_daily(ticker, start_d, end_d, auto_adjust=yf_auto_adj)
+            title = f"{ticker} (US) — source=yfinance"
+            return df, title
+
+        # 4) Upload
+        if us_source == "Upload CSV":
+            if up is None:
+                return pd.DataFrame(), "Upload a CSV first."
+            try:
+                df = pd.read_csv(up)
+                if "Date" not in df.columns:
+                    return pd.DataFrame(), "CSV missing Date column."
+                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+                df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+                need = {"Open","High","Low","Close"}
+                if not need.issubset(df.columns):
+                    return pd.DataFrame(), "CSV must have Open/High/Low/Close."
+                if "Volume" not in df.columns:
+                    df["Volume"] = 0
+                df = df.loc[(df.index >= pd.to_datetime(start_d)) & (df.index <= pd.to_datetime(end_d))]
+                return df[["Open","High","Low","Close","Volume"]].dropna(), f"{ticker} (US) — source=upload"
+            except Exception as e:
+                return pd.DataFrame(), f"Upload parse error: {e}"
+
+        return pd.DataFrame(), "Unknown US source."
 
     # Korea
     if not (kr_code6.isdigit() and len(kr_code6) == 6):
         return pd.DataFrame(), "KR code must be 6 digits"
-
     display = chosen_name or kr_code6
 
     if kr_source.startswith("pykrx"):
         df = fetch_pykrx_daily(kr_code6, start_d, end_d, adjusted=kr_adjusted)
-        title = f"{display} ({kr_code6}) — source=pykrx"
-        return df, title
-
+        return df, f"{display} ({kr_code6}) — source=pykrx"
     if kr_source.startswith("FinanceDataReader"):
         df = fetch_fdr_korea_daily(kr_code6, start_d, end_d)
-        title = f"{display} ({kr_code6}) — source=fdr"
-        return df, title
+        return df, f"{display} ({kr_code6}) — source=fdr"
 
     sym = f"{kr_code6}{infer_yahoo_suffix(kr_code6, listing_df)}"
     df = fetch_yfinance_daily(sym, start_d, end_d, auto_adjust=kr_adjusted)
-    title = f"{display} ({sym}) — source=yfinance"
-    return df, title
+    return df, f"{display} ({sym}) — source=yfinance"
 
 if run:
-    df, base_title = load_data()
+    df, title = load_data()
     df = ensure_ohlcv(df)
 
     if df.empty:
-        st.error(
-            "데이터를 가져오지 못했습니다.\n"
-            "- US: Stooq 응답이 CSV가 아니거나(차단/HTML), 네트워크가 막히면 빈 데이터가 올 수 있어요.\n"
-            "- yfinance fallback은 Streamlit Cloud에서 레이트리밋으로 실패할 수 있어요."
-        )
+        st.error(f"데이터를 가져오지 못했습니다.\n\nDetail: {title}")
         st.stop()
 
-    st.success(f"Loaded {len(df):,} rows | {base_title}")
+    st.success(f"Loaded {len(df):,} rows | {title}")
 
     if mode == "Single Strategy":
         fn = STRATEGY_SPECS[strat_name]["fn"]
         pos = fn(df, **(params or {}))
-
         equity, strat_ret, trades, metrics = run_backtest(df, pos, fee_bps=fee_bps, slippage_bps=slip_bps)
 
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -701,16 +674,13 @@ if run:
         c5.metric("Trades", f"{int(metrics.get('Trades', 0)):,}")
 
         tab1, tab2, tab3, tab4 = st.tabs(["Price & Signals", "Equity", "Trades", "Metrics"])
-
         with tab1:
-            st_plotly(plot_price_with_signals(df, pos, f"{base_title} — {strat_name}"), stretch=True)
+            st_plotly(plot_price_with_signals(df, pos, f"{title} — {strat_name}"), stretch=True)
             with st.expander("Raw data (tail)"):
                 st.dataframe(df.tail(300))
-
         with tab2:
             st_plotly(plot_equity(equity, "Equity Curve (start=1.0)"), stretch=True)
             st_plotly(plot_drawdown(equity, "Drawdown"), stretch=True)
-
         with tab3:
             st.dataframe(trades)
             st.download_button(
@@ -719,7 +689,6 @@ if run:
                 file_name="trades.csv",
                 mime="text/csv",
             )
-
         with tab4:
             mdf = pd.DataFrame([metrics]).T
             mdf.columns = ["Value"]
@@ -732,22 +701,17 @@ if run:
 
         results = []
         fig = go.Figure()
-
         for name in selected:
             spec = STRATEGY_SPECS[name]
             fn = spec["fn"]
-            defaults = spec.get("defaults", {})
-
-            pos = fn(df, **defaults)
-            equity, strat_ret, trades, metrics = run_backtest(df, pos, fee_bps=fee_bps, slippage_bps=slip_bps)
-
+            pos = fn(df)  # defaults
+            equity, _, _, metrics = run_backtest(df, pos, fee_bps=fee_bps, slippage_bps=slip_bps)
             fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines", name=name))
-
             row = {"Strategy": name}
             row.update(metrics)
             results.append(row)
 
-        fig.update_layout(title=f"{base_title} — Strategy Comparison (Equity start=1.0)", height=520)
+        fig.update_layout(title=f"{title} — Strategy Comparison (Equity start=1.0)", height=520)
         st_plotly(fig, stretch=True)
 
         res_df = pd.DataFrame(results)
@@ -758,8 +722,10 @@ if run:
             res_df["Sharpe (rf=0)"] = res_df["Sharpe (rf=0)"].round(2)
 
         st.subheader("Metrics (percent columns are %)")
-        sort_key = "CAGR" if "CAGR" in res_df.columns else "Total Return"
-        st.dataframe(res_df.sort_values(by=sort_key, ascending=False, na_position="last"))
+        st.dataframe(res_df.sort_values(by="CAGR", ascending=False, na_position="last"))
 
 else:
-    st.info("왼쪽에서 Market/종목/기간/전략을 고르고 **Run Backtest**를 누르세요.")
+    st.info(
+        "US에서 Stooq는 지금처럼 'daily hits limit'에 걸릴 수 있어요. :contentReference[oaicite:6]{index=6}\n"
+        "US는 Alpha Vantage 키를 쓰는 게 가장 안정적입니다(무료 키 가능, 호출 제한 있음). :contentReference[oaicite:7]{index=7}"
+    )
