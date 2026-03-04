@@ -35,18 +35,11 @@ def st_plotly(fig, stretch=True):
 # Text normalization (Korean search robustness)
 # ============================================================
 def normalize_name(x: str) -> str:
-    """
-    Normalize stock name for robust matching:
-    - NFKC normalize
-    - strip, collapse whitespace
-    - remove whitespace + punctuation/symbols (keep Korean/English/digits/_)
-    """
     x = unicodedata.normalize("NFKC", str(x))
     x = x.strip()
     x = re.sub(r"\s+", "", x)
-    x = re.sub(r"[^\w가-힣]", "", x)  # keep: Korean + word chars (A-Z a-z 0-9 _)
+    x = re.sub(r"[^\w가-힣]", "", x)
     return x
-
 
 def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
@@ -90,37 +83,58 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 
 
 # ============================================================
-# KRX listing / name table
+# KRX listing / name table (robust)
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def krx_listing():
-    """KRX listing from FinanceDataReader (if available)."""
+def krx_listing_fdr():
     if not FDR_OK:
         return None
     try:
         df = fdr.StockListing("KRX")
+        if df is None or df.empty:
+            return None
         return df
     except Exception:
         return None
 
+def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = set(df.columns.astype(str))
+    for c in candidates:
+        if c in cols:
+            return c
+    # case-insensitive fallback
+    lower_map = {str(c).lower(): str(c) for c in df.columns}
+    for c in candidates:
+        if c.lower() in lower_map:
+            return lower_map[c.lower()]
+    return None
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def krx_name_table():
     """
-    Name<->Symbol table.
-    Prefer FinanceDataReader, fallback to pykrx.
-    Always add NameNorm for robust Korean search.
+    Return DataFrame columns: [Name, Symbol, NameNorm]
+    Prefer FDR, fallback to pykrx
     """
-    # 1) FDR
+    # 1) FinanceDataReader
     if FDR_OK:
-        df = krx_listing()
-        if df is not None and not df.empty and ("Name" in df.columns) and ("Symbol" in df.columns):
-            out = df[["Name", "Symbol"]].copy()
-            out["Name"] = out["Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
-            out["Symbol"] = out["Symbol"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(6)
-            out = out.dropna()
-            out = out[out["Symbol"].str.len() == 6]
-            out["NameNorm"] = out["Name"].map(normalize_name)
-            return out.drop_duplicates()
+        df = krx_listing_fdr()
+        if df is not None and not df.empty:
+            name_col = _pick_col(df, ["Name", "종목명", "name"])
+            code_col = _pick_col(df, ["Symbol", "Code", "종목코드", "코드", "Ticker", "티커"])
+            if name_col and code_col:
+                out = df[[name_col, code_col]].copy()
+                out = out.rename(columns={name_col: "Name", code_col: "Symbol"})
+                out["Name"] = out["Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
+
+                # Extract exactly 6 digits anywhere (handles "A005930" too)
+                out["Symbol"] = out["Symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
+                out = out.dropna(subset=["Symbol"])
+                out["Symbol"] = out["Symbol"].astype(str)
+
+                out["NameNorm"] = out["Name"].map(normalize_name)
+                out = out.drop_duplicates()
+                if not out.empty:
+                    return out
 
     # 2) pykrx fallback
     if PYKRX_OK:
@@ -140,15 +154,7 @@ def krx_name_table():
     return None
 
 
-def search_krx_candidates(user_input: str, topn: int = 50) -> pd.DataFrame:
-    """
-    Return candidates DataFrame with columns [Name, Symbol, NameNorm].
-    Search order:
-      1) exact match on normalized
-      2) contains on original (regex=False)
-      3) contains on normalized (regex=False)
-      4) fuzzy 추천 (유사도 상위)
-    """
+def search_krx_candidates(user_input: str, topn: int = 80) -> pd.DataFrame:
     s = (user_input or "").strip()
     tbl = krx_name_table()
     if tbl is None or tbl.empty or not s:
@@ -156,7 +162,7 @@ def search_krx_candidates(user_input: str, topn: int = 50) -> pd.DataFrame:
 
     sn = normalize_name(s)
 
-    # 1) exact match (normalized)
+    # 1) exact normalized
     exact = tbl[tbl["NameNorm"] == sn].copy()
     if not exact.empty:
         return exact.head(topn)
@@ -171,30 +177,20 @@ def search_krx_candidates(user_input: str, topn: int = 50) -> pd.DataFrame:
     if not hits.empty:
         return hits.head(topn)
 
-    # 4) fuzzy 추천 (상위 topn)
-    # 너무 짧은 입력(한 글자 등)은 추천이 의미 없을 수 있어서 길이 조건
+    # 4) fuzzy suggestions (if input too short, skip)
     if len(sn) < 2:
         return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
 
-    # compute similarity on NameNorm
     tmp = tbl[["Name", "Symbol", "NameNorm"]].copy()
     tmp["score"] = tmp["NameNorm"].map(lambda x: similarity(sn, x))
     tmp = tmp.sort_values("score", ascending=False)
-    tmp = tmp[tmp["score"] >= 0.5].head(topn)  # 임계값: 0.5 (너무 낮으면 잡음 많음)
+    tmp = tmp[tmp["score"] >= 0.50].head(topn)
     return tmp.drop(columns=["score"], errors="ignore")
 
 
 def resolve_kr_input_to_code(user_input: str):
-    """
-    Input can be:
-      - 6-digit code: "005930"
-      - Korean name: "삼성전자"
-    Returns:
-      (code6, chosen_name, candidates_df)
-    """
     s = (user_input or "").strip()
 
-    # code direct
     if s.isdigit() and len(s) == 6:
         return s, None, None
 
@@ -202,7 +198,6 @@ def resolve_kr_input_to_code(user_input: str):
     if candidates is None or candidates.empty:
         return None, None, candidates
 
-    # if a single candidate, auto-pick
     if len(candidates) == 1:
         return candidates.iloc[0]["Symbol"], candidates.iloc[0]["Name"], candidates
 
@@ -258,7 +253,7 @@ def ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# Backtest engine (long/flat, close-to-close simplified)
+# Backtest engine
 # ============================================================
 def positions_to_trades(close: pd.Series, pos: pd.Series) -> pd.DataFrame:
     pos = pos.fillna(0).astype(float)
@@ -327,10 +322,6 @@ def compute_metrics(equity: pd.Series, strat_ret: pd.Series, trades: pd.DataFram
     }
 
 def run_backtest(df: pd.DataFrame, pos: pd.Series, fee_bps: float, slippage_bps: float):
-    """
-    신호(pos)는 오늘 종가로 계산했다고 보고,
-    수익 계산은 pos.shift(1)로 다음 거래일부터 보유(룩어헤드 방지).
-    """
     close = df["Close"].astype(float)
     ret = close.pct_change().fillna(0.0)
 
@@ -351,7 +342,7 @@ def run_backtest(df: pd.DataFrame, pos: pd.Series, fee_bps: float, slippage_bps:
 
 
 # ============================================================
-# Strategies (long/flat)
+# Strategies
 # ============================================================
 def strat_buyhold(df, **params):
     return pd.Series(1.0, index=df.index)
@@ -418,51 +409,40 @@ def strat_donchian_breakout(df, n=20, **params):
 
 
 STRATEGIES = {
-    "Buy & Hold": {
-        "fn": strat_buyhold,
-        "desc": "항상 보유(기준선).",
-        "params": []
-    },
+    "Buy & Hold": {"fn": strat_buyhold, "desc": "항상 보유(기준선).", "params": []},
     "SMA Crossover": {
-        "fn": strat_sma_cross,
-        "desc": "FAST SMA > SLOW SMA이면 보유.",
+        "fn": strat_sma_cross, "desc": "FAST SMA > SLOW SMA이면 보유.",
         "params": [
             dict(name="fast", label="FAST SMA", kind="int", min=5, max=200, step=1, default=20),
             dict(name="slow", label="SLOW SMA", kind="int", min=10, max=400, step=1, default=60),
-        ]
+        ],
     },
     "MACD Trend": {
-        "fn": strat_macd_trend,
-        "desc": "MACD > Signal이면 보유.",
+        "fn": strat_macd_trend, "desc": "MACD > Signal이면 보유.",
         "params": [
             dict(name="fast", label="MACD fast EMA", kind="int", min=3, max=50, step=1, default=12),
             dict(name="slow", label="MACD slow EMA", kind="int", min=10, max=120, step=1, default=26),
             dict(name="signal", label="Signal EMA", kind="int", min=3, max=30, step=1, default=9),
-        ]
+        ],
     },
     "RSI Mean Reversion": {
-        "fn": strat_rsi_reversion,
-        "desc": "RSI<LOW면 진입, RSI>HIGH면 청산.",
+        "fn": strat_rsi_reversion, "desc": "RSI<LOW면 진입, RSI>HIGH면 청산.",
         "params": [
             dict(name="n", label="RSI period", kind="int", min=5, max=50, step=1, default=14),
             dict(name="low", label="Entry (LOW)", kind="int", min=5, max=45, step=1, default=30),
             dict(name="high", label="Exit (HIGH)", kind="int", min=55, max=95, step=1, default=70),
-        ]
+        ],
     },
     "Bollinger Mean Reversion": {
-        "fn": strat_bollinger_reversion,
-        "desc": "하단밴드 이탈 진입, 중단선 회귀 청산.",
+        "fn": strat_bollinger_reversion, "desc": "하단밴드 이탈 진입, 중단선 회귀 청산.",
         "params": [
             dict(name="n", label="BB period", kind="int", min=5, max=60, step=1, default=20),
             dict(name="k", label="Std multiplier (k)", kind="float", min=1.0, max=4.0, step=0.1, default=2.0),
-        ]
+        ],
     },
     "Donchian Breakout": {
-        "fn": strat_donchian_breakout,
-        "desc": "채널 상단 돌파 진입, 하단 이탈 청산.",
-        "params": [
-            dict(name="n", label="Donchian window", kind="int", min=5, max=120, step=1, default=20),
-        ]
+        "fn": strat_donchian_breakout, "desc": "채널 상단 돌파 진입, 하단 이탈 청산.",
+        "params": [dict(name="n", label="Donchian window", kind="int", min=5, max=120, step=1, default=20)],
     },
 }
 
@@ -481,15 +461,11 @@ def plot_price_with_signals(df: pd.DataFrame, pos: pd.Series, title: str):
     fig.add_trace(go.Scatter(x=df.index, y=c, mode="lines", name="Close"))
 
     if len(entries) > 0:
-        fig.add_trace(go.Scatter(
-            x=entries, y=c.loc[entries], mode="markers", name="BUY",
-            marker=dict(symbol="triangle-up", size=10)
-        ))
+        fig.add_trace(go.Scatter(x=entries, y=c.loc[entries], mode="markers", name="BUY",
+                                 marker=dict(symbol="triangle-up", size=10)))
     if len(exits) > 0:
-        fig.add_trace(go.Scatter(
-            x=exits, y=c.loc[exits], mode="markers", name="SELL",
-            marker=dict(symbol="triangle-down", size=10)
-        ))
+        fig.add_trace(go.Scatter(x=exits, y=c.loc[exits], mode="markers", name="SELL",
+                                 marker=dict(symbol="triangle-down", size=10)))
 
     fig.update_layout(title=title, height=520, xaxis_title="Date", yaxis_title="Price")
     return fig
@@ -518,7 +494,6 @@ def latest_signal_from_pos(pos: pd.Series):
         return "—", "Not enough data."
     prev_pos = int(pos.iloc[-2])
     last_pos = int(pos.iloc[-1])
-
     if prev_pos == 0 and last_pos == 1:
         return "BUY", "0→1 (현금→보유)"
     if prev_pos == 1 and last_pos == 0:
@@ -546,23 +521,30 @@ with st.sidebar:
 
     code6, chosen_name, candidates = resolve_kr_input_to_code(stock_input)
 
-    # 디버그(원하면 지워도 됨): 한글 검색이 안 될 때 원인 확인용 팩트 출력
-    with st.expander("Debug (문제 해결용)", expanded=False):
+    with st.expander("Debug (문제 해결용)", expanded=True):
         st.write("FDR_OK:", FDR_OK, "| PYKRX_OK:", PYKRX_OK)
+        df_list = krx_listing_fdr()
+        st.write("FDR listing is None?:", df_list is None)
+        if df_list is not None:
+            st.write("FDR listing columns:", list(df_list.columns))
+            st.dataframe(df_list.head(5))
         tbl = krx_name_table()
         st.write("Name table rows:", 0 if (tbl is None) else len(tbl))
         st.write("Input normalized:", normalize_name(stock_input))
 
     if code6 is None:
         if candidates is None or candidates.empty:
-            st.error("종목명을 찾지 못했어요. (오타/띄어쓰기/우선주 표기 확인)  \n또는 종목명 테이블 로딩 실패일 수 있어요 → Clear cache 눌러보세요.")
+            st.error(
+                "한글 검색이 안 되는 이유: 종목명 테이블이 비어있습니다(=KRX listing 로딩 실패).\n"
+                "해결: 1) pykrx 설치(추천) 또는 2) lxml/html5lib 설치 후 Clear cache.\n"
+                "현재 상태에서는 한글→코드 변환이 불가능합니다."
+            )
             st.stop()
 
         if len(candidates) == 1:
             code6 = candidates.iloc[0]["Symbol"]
             chosen_name = candidates.iloc[0]["Name"]
         else:
-            # 검색 결과가 여러 개면 선택하게
             options = (candidates["Symbol"] + " — " + candidates["Name"]).tolist()
             pick = st.selectbox("검색 결과(여러 개면 선택)", options)
             code6 = pick.split(" — ")[0].strip()
@@ -687,7 +669,6 @@ if run:
             )
         with tab4:
             st.dataframe(pd.DataFrame([metrics]).T.rename(columns={0: "Value"}))
-
     else:
         if not selected:
             st.warning("Select at least one strategy.")
@@ -721,6 +702,5 @@ if run:
         st.subheader("Metrics (percent columns are %)")
         sort_key = "CAGR" if "CAGR" in res_df.columns else "Total Return"
         st.dataframe(res_df.sort_values(by=sort_key, ascending=False, na_position="last"))
-
 else:
     st.info("왼쪽 사이드바에서 종목(한글/코드)과 기간/전략을 고르고 **Run**을 누르세요.")
