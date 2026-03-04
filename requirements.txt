@@ -7,3 +7,5 @@ finance-datareader
 pykrx
 pandas-datareader
 requests
+lxml
+html5lib
