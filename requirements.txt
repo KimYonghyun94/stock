@@ -4,7 +4,6 @@ numpy
 plotly
 yfinance
 finance-datareader
-pykrx
 pandas-datareader
 requests
 lxml
