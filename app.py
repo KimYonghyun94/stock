@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import re
 import unicodedata
 from difflib import SequenceMatcher
+from typing import Optional, Tuple
 
 # Optional deps (KR only)
 try:
@@ -19,6 +20,12 @@ try:
     PYKRX_OK = True
 except Exception:
     PYKRX_OK = False
+
+try:
+    import requests
+    REQ_OK = True
+except Exception:
+    REQ_OK = False
 
 
 # -----------------------------
@@ -83,10 +90,10 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 
 
 # ============================================================
-# KRX listing / name table (robust)
+# KRX name table sources
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def krx_listing_fdr():
+def krx_listing_fdr() -> Optional[pd.DataFrame]:
     if not FDR_OK:
         return None
     try:
@@ -97,46 +104,98 @@ def krx_listing_fdr():
     except Exception:
         return None
 
-def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols = set(df.columns.astype(str))
-    for c in candidates:
-        if c in cols:
-            return c
-    # case-insensitive fallback
-    lower_map = {str(c).lower(): str(c) for c in df.columns}
-    for c in candidates:
-        if c.lower() in lower_map:
-            return lower_map[c.lower()]
+@st.cache_data(ttl=3600, show_spinner=False)
+def krx_listing_kind() -> Optional[pd.DataFrame]:
+    """
+    FDR가 막히는 환경에서도 KRX KIND 다운로드는 되는 경우가 있어서 fallback으로 사용.
+    pandas.read_html 파서(lxml/bs4 등)가 없으면 실패할 수 있음.
+    """
+    if not REQ_OK:
+        return None
+
+    urls = [
+        "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
+        "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download",
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+    }
+
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+
+            # KIND는 euc-kr로 내려오는 경우가 많음
+            text = r.content.decode("euc-kr", errors="ignore")
+
+            tables = pd.read_html(text)
+            if tables and len(tables) > 0 and not tables[0].empty:
+                return tables[0]
+        except Exception:
+            continue
+
     return None
 
+
+def _pick_col(df: pd.DataFrame, candidates: list) -> Optional[str]:
+    cols = [str(c) for c in df.columns]
+    colset = set(cols)
+    for c in candidates:
+        if c in colset:
+            return c
+    low_map = {c.lower(): c for c in cols}
+    for c in candidates:
+        if str(c).lower() in low_map:
+            return low_map[str(c).lower()]
+    return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def krx_name_table():
+def krx_name_table() -> Optional[pd.DataFrame]:
     """
-    Return DataFrame columns: [Name, Symbol, NameNorm]
-    Prefer FDR, fallback to pykrx
+    Return columns: [Name, Symbol, NameNorm]
+    Source order:
+      1) FinanceDataReader listing
+      2) KRX KIND download listing
+      3) pykrx
     """
-    # 1) FinanceDataReader
-    if FDR_OK:
-        df = krx_listing_fdr()
-        if df is not None and not df.empty:
-            name_col = _pick_col(df, ["Name", "종목명", "name"])
-            code_col = _pick_col(df, ["Symbol", "Code", "종목코드", "코드", "Ticker", "티커"])
-            if name_col and code_col:
-                out = df[[name_col, code_col]].copy()
-                out = out.rename(columns={name_col: "Name", code_col: "Symbol"})
-                out["Name"] = out["Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
+    # 1) FDR
+    df = krx_listing_fdr()
+    if df is not None and not df.empty:
+        name_col = _pick_col(df, ["Name", "종목명"])
+        code_col = _pick_col(df, ["Symbol", "Code", "종목코드", "코드", "Ticker", "티커"])
+        if name_col and code_col:
+            out = df[[name_col, code_col]].copy()
+            out = out.rename(columns={name_col: "Name", code_col: "Symbol"})
+            out["Name"] = out["Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
+            out["Symbol"] = out["Symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
+            out = out.dropna(subset=["Symbol"])
+            out["Symbol"] = out["Symbol"].astype(str)
+            out["NameNorm"] = out["Name"].map(normalize_name)
+            out = out.drop_duplicates()
+            if not out.empty:
+                return out
 
-                # Extract exactly 6 digits anywhere (handles "A005930" too)
-                out["Symbol"] = out["Symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
-                out = out.dropna(subset=["Symbol"])
-                out["Symbol"] = out["Symbol"].astype(str)
+    # 2) KIND
+    dfk = krx_listing_kind()
+    if dfk is not None and not dfk.empty:
+        name_col = _pick_col(dfk, ["회사명", "종목명", "Name"])
+        code_col = _pick_col(dfk, ["종목코드", "Symbol", "Code"])
+        if name_col and code_col:
+            out = dfk[[name_col, code_col]].copy()
+            out = out.rename(columns={name_col: "Name", code_col: "Symbol"})
+            out["Name"] = out["Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
+            out["Symbol"] = out["Symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
+            out = out.dropna(subset=["Symbol"])
+            out["Symbol"] = out["Symbol"].astype(str)
+            out["NameNorm"] = out["Name"].map(normalize_name)
+            out = out.drop_duplicates()
+            if not out.empty:
+                return out
 
-                out["NameNorm"] = out["Name"].map(normalize_name)
-                out = out.drop_duplicates()
-                if not out.empty:
-                    return out
-
-    # 2) pykrx fallback
+    # 3) pykrx
     if PYKRX_OK:
         try:
             codes = krx_stock.get_market_ticker_list(market="ALL")
@@ -162,22 +221,17 @@ def search_krx_candidates(user_input: str, topn: int = 80) -> pd.DataFrame:
 
     sn = normalize_name(s)
 
-    # 1) exact normalized
     exact = tbl[tbl["NameNorm"] == sn].copy()
     if not exact.empty:
         return exact.head(topn)
 
-    # 2) contains original (regex OFF)
     hits1 = tbl[tbl["Name"].str.contains(s, na=False, regex=False)].copy()
-
-    # 3) contains normalized (regex OFF)
     hits2 = tbl[tbl["NameNorm"].str.contains(sn, na=False, regex=False)].copy()
 
     hits = pd.concat([hits1, hits2], ignore_index=True).drop_duplicates()
     if not hits.empty:
         return hits.head(topn)
 
-    # 4) fuzzy suggestions (if input too short, skip)
     if len(sn) < 2:
         return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
 
@@ -188,9 +242,8 @@ def search_krx_candidates(user_input: str, topn: int = 80) -> pd.DataFrame:
     return tmp.drop(columns=["score"], errors="ignore")
 
 
-def resolve_kr_input_to_code(user_input: str):
+def resolve_kr_input_to_code(user_input: str) -> Tuple[Optional[str], Optional[str], Optional[pd.DataFrame]]:
     s = (user_input or "").strip()
-
     if s.isdigit() and len(s) == 6:
         return s, None, None
 
@@ -407,7 +460,6 @@ def strat_donchian_breakout(df, n=20, **params):
         pos.loc[t] = float(in_pos)
     return pos
 
-
 STRATEGIES = {
     "Buy & Hold": {"fn": strat_buyhold, "desc": "항상 보유(기준선).", "params": []},
     "SMA Crossover": {
@@ -513,7 +565,7 @@ with st.sidebar:
     st.header("Cache")
     if st.button("Clear cache"):
         st.cache_data.clear()
-        st.success("Cache cleared (종목명 테이블도 새로 로딩됩니다)")
+        st.success("Cache cleared")
 
     st.divider()
     st.header("종목 입력")
@@ -522,23 +574,27 @@ with st.sidebar:
     code6, chosen_name, candidates = resolve_kr_input_to_code(stock_input)
 
     with st.expander("Debug (문제 해결용)", expanded=True):
-        st.write("FDR_OK:", FDR_OK, "| PYKRX_OK:", PYKRX_OK)
-        df_list = krx_listing_fdr()
-        st.write("FDR listing is None?:", df_list is None)
-        if df_list is not None:
-            st.write("FDR listing columns:", list(df_list.columns))
-            st.dataframe(df_list.head(5))
+        st.write("FDR_OK:", FDR_OK, "| PYKRX_OK:", PYKRX_OK, "| REQ_OK:", REQ_OK)
+        df_fdr = krx_listing_fdr()
+        st.write("FDR listing is None?:", df_fdr is None)
+        df_kind = krx_listing_kind()
+        st.write("KIND listing is None?:", df_kind is None)
         tbl = krx_name_table()
         st.write("Name table rows:", 0 if (tbl is None) else len(tbl))
         st.write("Input normalized:", normalize_name(stock_input))
 
+    # 종목명 테이블이 없으면 한글 검색 불가능(팩트) → 코드 입력만 유도
+    tbl_now = krx_name_table()
+    if (tbl_now is None) or (len(tbl_now) == 0):
+        st.warning(
+            "현재 환경에서 KRX 종목명 테이블을 가져오지 못했습니다.\n"
+            "한글 검색은 불가능하며(데이터 0개), 6자리 종목코드로만 입력 가능합니다.\n"
+            "해결: pykrx 설치(추천) 또는 requests/lxml/html5lib/bs4 설치 후 Clear cache."
+        )
+
     if code6 is None:
         if candidates is None or candidates.empty:
-            st.error(
-                "한글 검색이 안 되는 이유: 종목명 테이블이 비어있습니다(=KRX listing 로딩 실패).\n"
-                "해결: 1) pykrx 설치(추천) 또는 2) lxml/html5lib 설치 후 Clear cache.\n"
-                "현재 상태에서는 한글→코드 변환이 불가능합니다."
-            )
+            st.info("종목코드를 알고 있으면 6자리로 입력하세요. 예: 삼성전자 = 005930")
             st.stop()
 
         if len(candidates) == 1:
@@ -568,6 +624,7 @@ with st.sidebar:
     st.divider()
     st.header("데이터 소스 (KRX)")
     sources = []
+    # pykrx가 있으면 pykrx 우선
     if PYKRX_OK: sources.append("pykrx (KRX)")
     if FDR_OK: sources.append("FinanceDataReader (KRX)")
     if not sources:
