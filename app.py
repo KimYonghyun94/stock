@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import re
 import unicodedata
 # Optional deps (KR only)
-try:
+try:f
     import FinanceDataReader as fdr  # pip name: finance-datareader
     FDR_OK = True
 except Exception:
@@ -475,7 +475,7 @@ with st.sidebar:
     if st.button("Clear cache"):
         st.cache_data.clear()
         st.success("Cache cleared")
-
+    
     st.divider()
     st.header("종목 입력")
     stock_input = st.text_input("6자리 코드 또는 한글 종목명", value="삼성전자")
@@ -563,7 +563,8 @@ with st.sidebar:
 
     st.divider()
     run = st.button("Run", type="primary")
-
+    st.write("FDR_OK:", FDR_OK, "PYKRX_OK:", PYKRX_OK)
+    st.write("name_table rows:", 0 if krx_name_table() is None else len(krx_name_table()))
 
 def load_korea_data(code6_: str):
     display = chosen_name or code6_
