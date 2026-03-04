@@ -1,31 +1,44 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import io
+import os
+import re
+import time
+import unicodedata
+import traceback
+from pathlib import Path
 from datetime import date, timedelta
 import plotly.graph_objects as go
-import re
-import unicodedata
 from difflib import SequenceMatcher
-from typing import Optional, Tuple
 
+# =========================
 # Optional deps (KR only)
+# =========================
 try:
-    import FinanceDataReader as fdr  # pip name: finance-datareader
+    import FinanceDataReader as fdr  # pip install finance-datareader
     FDR_OK = True
 except Exception:
     FDR_OK = False
 
 try:
-    from pykrx import stock as krx_stock
+    from pykrx import stock as krx_stock  # pip install pykrx
     PYKRX_OK = True
 except Exception:
     PYKRX_OK = False
 
 try:
-    import requests
+    import requests  # pip install requests
     REQ_OK = True
 except Exception:
     REQ_OK = False
+
+
+# =========================
+# Constants
+# =========================
+KRX_CACHE_PATH = Path("krx_symbols.csv")
+KIND_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13"
 
 
 # -----------------------------
@@ -90,143 +103,152 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 
 
 # ============================================================
-# KRX name table sources
+# Symbol table (Name <-> 6-digit code)
 # ============================================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def krx_listing_fdr() -> Optional[pd.DataFrame]:
-    if not FDR_OK:
-        return None
-    try:
-        df = fdr.StockListing("KRX")
-        if df is None or df.empty:
-            return None
-        return df
-    except Exception:
-        return None
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def krx_listing_kind() -> Optional[pd.DataFrame]:
-    """
-    FDR가 막히는 환경에서도 KRX KIND 다운로드는 되는 경우가 있어서 fallback으로 사용.
-    pandas.read_html 파서(lxml/bs4 등)가 없으면 실패할 수 있음.
-    """
-    if not REQ_OK:
-        return None
-
-    urls = [
-        "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
-        "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download",
-    ]
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-    }
-
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=20)
-            r.raise_for_status()
-
-            # KIND는 euc-kr로 내려오는 경우가 많음
-            text = r.content.decode("euc-kr", errors="ignore")
-
-            tables = pd.read_html(text)
-            if tables and len(tables) > 0 and not tables[0].empty:
-                return tables[0]
-        except Exception:
-            continue
-
-    return None
-
-
-def _pick_col(df: pd.DataFrame, candidates: list) -> Optional[str]:
+def _pick_col(df: pd.DataFrame, candidates):
     cols = [str(c) for c in df.columns]
     colset = set(cols)
     for c in candidates:
         if c in colset:
             return c
-    low_map = {c.lower(): c for c in cols}
+    lower_map = {c.lower(): c for c in cols}
     for c in candidates:
-        if str(c).lower() in low_map:
-            return low_map[str(c).lower()]
+        cc = str(c).lower()
+        if cc in lower_map:
+            return lower_map[cc]
     return None
 
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def krx_name_table() -> Optional[pd.DataFrame]:
+def coerce_symbol_table(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Return columns: [Name, Symbol, NameNorm]
-    Source order:
-      1) FinanceDataReader listing
-      2) KRX KIND download listing
-      3) pykrx
+    입력 df에서 Name/Symbol(6자리)을 뽑아 표준화
+    output columns: Name, Symbol, NameNorm
     """
-    # 1) FDR
-    df = krx_listing_fdr()
-    if df is not None and not df.empty:
-        name_col = _pick_col(df, ["Name", "종목명"])
-        code_col = _pick_col(df, ["Symbol", "Code", "종목코드", "코드", "Ticker", "티커"])
-        if name_col and code_col:
-            out = df[[name_col, code_col]].copy()
-            out = out.rename(columns={name_col: "Name", code_col: "Symbol"})
-            out["Name"] = out["Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
-            out["Symbol"] = out["Symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
-            out = out.dropna(subset=["Symbol"])
-            out["Symbol"] = out["Symbol"].astype(str)
-            out["NameNorm"] = out["Name"].map(normalize_name)
-            out = out.drop_duplicates()
-            if not out.empty:
-                return out
-
-    # 2) KIND
-    dfk = krx_listing_kind()
-    if dfk is not None and not dfk.empty:
-        name_col = _pick_col(dfk, ["회사명", "종목명", "Name"])
-        code_col = _pick_col(dfk, ["종목코드", "Symbol", "Code"])
-        if name_col and code_col:
-            out = dfk[[name_col, code_col]].copy()
-            out = out.rename(columns={name_col: "Name", code_col: "Symbol"})
-            out["Name"] = out["Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
-            out["Symbol"] = out["Symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
-            out = out.dropna(subset=["Symbol"])
-            out["Symbol"] = out["Symbol"].astype(str)
-            out["NameNorm"] = out["Name"].map(normalize_name)
-            out = out.drop_duplicates()
-            if not out.empty:
-                return out
-
-    # 3) pykrx
-    if PYKRX_OK:
-        try:
-            codes = krx_stock.get_market_ticker_list(market="ALL")
-            rows = []
-            for c in codes:
-                nm = krx_stock.get_market_ticker_name(c)
-                nm = unicodedata.normalize("NFKC", str(nm)).strip()
-                rows.append((nm, str(c).zfill(6)))
-            out = pd.DataFrame(rows, columns=["Name", "Symbol"]).drop_duplicates()
-            out["NameNorm"] = out["Name"].map(normalize_name)
-            return out
-        except Exception:
-            return None
-
-    return None
-
-
-def search_krx_candidates(user_input: str, topn: int = 80) -> pd.DataFrame:
-    s = (user_input or "").strip()
-    tbl = krx_name_table()
-    if tbl is None or tbl.empty or not s:
+    if df is None or df.empty:
         return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
 
+    if "Name" not in df.columns or "Symbol" not in df.columns:
+        name_col = _pick_col(df, ["Name", "종목명", "회사명"])
+        code_col = _pick_col(df, ["Symbol", "Code", "종목코드", "코드", "Ticker", "티커"])
+        if not name_col or not code_col:
+            return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
+        df = df[[name_col, code_col]].copy()
+        df.columns = ["Name", "Symbol"]
+    else:
+        df = df[["Name", "Symbol"]].copy()
+
+    df["Name"] = df["Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
+    df["Symbol"] = df["Symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
+    df = df.dropna(subset=["Symbol"])
+    df["Symbol"] = df["Symbol"].astype(str).str.zfill(6)
+    df["NameNorm"] = df["Name"].map(normalize_name)
+    return df.drop_duplicates()
+
+def built_in_min_table() -> pd.DataFrame:
+    rows = [
+        ("삼성전자", "005930"),
+        ("SK하이닉스", "000660"),
+        ("NAVER", "035420"),
+        ("카카오", "035720"),
+        ("현대차", "005380"),
+        ("LG화학", "051910"),
+        ("삼성바이오로직스", "207940"),
+        ("삼성SDI", "006400"),
+        ("셀트리온", "068270"),
+        ("기아", "000270"),
+    ]
+    return coerce_symbol_table(pd.DataFrame(rows, columns=["Name", "Symbol"]))
+
+def cache_is_fresh(path: Path, max_age_days: int) -> bool:
+    if not path.exists():
+        return False
+    age_sec = time.time() - path.stat().st_mtime
+    return age_sec <= max_age_days * 86400
+
+def download_kind_to_df(timeout: int = 20) -> pd.DataFrame:
+    """
+    KIND에서 상장사 리스트 다운로드 후 DataFrame 반환
+    (주의: 네트워크/방화벽/프록시/SSL에 따라 실패할 수 있음)
+    """
+    if not REQ_OK:
+        raise RuntimeError("requests가 설치되어 있지 않습니다.")
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+    }
+    r = requests.get(KIND_URL, headers=headers, timeout=timeout)
+    r.raise_for_status()
+
+    # KIND는 euc-kr로 내려오는 경우가 많음
+    text = r.content.decode("euc-kr", errors="ignore")
+    tables = pd.read_html(text)  # lxml/html5lib/bs4 필요할 수 있음
+    if not tables:
+        raise RuntimeError("pandas.read_html 결과가 비어있습니다(파서 문제 또는 응답이 HTML 아님).")
+
+    df = tables[0]
+    name_col = _pick_col(df, ["회사명", "종목명", "Name"])
+    code_col = _pick_col(df, ["종목코드", "Symbol", "Code"])
+    if not name_col or not code_col:
+        raise RuntimeError(f"KIND 테이블 컬럼을 찾지 못했습니다. columns={list(df.columns)}")
+
+    out = df[[name_col, code_col]].copy()
+    out.columns = ["Name", "Symbol"]
+    out["Symbol"] = out["Symbol"].astype(str).str.extract(r"(\d{6})", expand=False)
+    out = out.dropna(subset=["Symbol"])
+    out["Symbol"] = out["Symbol"].astype(str).str.zfill(6)
+    return out
+
+def save_df_to_cache_csv(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_symbol_table_from_csv_bytes(b: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(b))
+    return coerce_symbol_table(df)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_symbol_table_from_local_csv(path_str: str) -> pd.DataFrame:
+    df = pd.read_csv(path_str)
+    return coerce_symbol_table(df)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def try_pykrx_symbol_table() -> pd.DataFrame:
+    if not PYKRX_OK:
+        return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
+    try:
+        codes = krx_stock.get_market_ticker_list(market="ALL")
+        rows = []
+        for c in codes:
+            nm = krx_stock.get_market_ticker_name(c)
+            nm = unicodedata.normalize("NFKC", str(nm)).strip()
+            rows.append((nm, str(c).zfill(6)))
+        return coerce_symbol_table(pd.DataFrame(rows, columns=["Name", "Symbol"]))
+    except Exception:
+        return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def try_fdr_symbol_table() -> pd.DataFrame:
+    if not FDR_OK:
+        return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
+    try:
+        df = fdr.StockListing("KRX")
+        return coerce_symbol_table(df)
+    except Exception:
+        return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
+
+
+def search_candidates(symtbl: pd.DataFrame, user_input: str, topn: int = 80) -> pd.DataFrame:
+    s = (user_input or "").strip()
+    if symtbl is None or symtbl.empty or not s:
+        return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
     sn = normalize_name(s)
 
-    exact = tbl[tbl["NameNorm"] == sn].copy()
+    exact = symtbl[symtbl["NameNorm"] == sn].copy()
     if not exact.empty:
         return exact.head(topn)
 
-    hits1 = tbl[tbl["Name"].str.contains(s, na=False, regex=False)].copy()
-    hits2 = tbl[tbl["NameNorm"].str.contains(sn, na=False, regex=False)].copy()
+    hits1 = symtbl[symtbl["Name"].str.contains(s, na=False, regex=False)].copy()
+    hits2 = symtbl[symtbl["NameNorm"].str.contains(sn, na=False, regex=False)].copy()
 
     hits = pd.concat([hits1, hits2], ignore_index=True).drop_duplicates()
     if not hits.empty:
@@ -235,26 +257,22 @@ def search_krx_candidates(user_input: str, topn: int = 80) -> pd.DataFrame:
     if len(sn) < 2:
         return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
 
-    tmp = tbl[["Name", "Symbol", "NameNorm"]].copy()
+    tmp = symtbl[["Name", "Symbol", "NameNorm"]].copy()
     tmp["score"] = tmp["NameNorm"].map(lambda x: similarity(sn, x))
     tmp = tmp.sort_values("score", ascending=False)
     tmp = tmp[tmp["score"] >= 0.50].head(topn)
     return tmp.drop(columns=["score"], errors="ignore")
 
-
-def resolve_kr_input_to_code(user_input: str) -> Tuple[Optional[str], Optional[str], Optional[pd.DataFrame]]:
+def resolve_input_to_code(symtbl: pd.DataFrame, user_input: str):
     s = (user_input or "").strip()
     if s.isdigit() and len(s) == 6:
-        return s, None, None
-
-    candidates = search_krx_candidates(s, topn=80)
-    if candidates is None or candidates.empty:
-        return None, None, candidates
-
-    if len(candidates) == 1:
-        return candidates.iloc[0]["Symbol"], candidates.iloc[0]["Name"], candidates
-
-    return None, None, candidates
+        return s, None, None  # code, chosen_name, candidates
+    cands = search_candidates(symtbl, s, topn=80)
+    if cands.empty:
+        return None, None, cands
+    if len(cands) == 1:
+        return cands.iloc[0]["Symbol"], cands.iloc[0]["Name"], cands
+    return None, None, cands
 
 
 # ============================================================
@@ -287,7 +305,7 @@ def fetch_pykrx_daily(code6: str, start: date, end: date, adjusted: bool = True)
         )
         if df is None or df.empty:
             return pd.DataFrame()
-        df = df.rename(columns={"시가":"Open","고가":"High","저가":"Low","종가":"Close","거래량":"Volume"})
+        df = df.rename(columns={"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"})
         df.index.name = "Date"
         return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     except Exception:
@@ -297,16 +315,16 @@ def ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy().sort_index()
-    needed = {"Open","High","Low","Close"}
+    needed = {"Open", "High", "Low", "Close"}
     if not needed.issubset(df.columns):
         return pd.DataFrame()
     if "Volume" not in df.columns:
         df["Volume"] = 0
-    return df.dropna(subset=["Open","High","Low","Close"])
+    return df.dropna(subset=["Open", "High", "Low", "Close"])
 
 
 # ============================================================
-# Backtest engine
+# Backtest engine (long/flat, close-to-close simplified)
 # ============================================================
 def positions_to_trades(close: pd.Series, pos: pd.Series) -> pd.DataFrame:
     pos = pos.fillna(0).astype(float)
@@ -330,9 +348,9 @@ def positions_to_trades(close: pd.Series, pos: pd.Series) -> pd.DataFrame:
         trades.append([entry_dt, exit_dt, entry_px, exit_px, exit_px / entry_px - 1.0])
 
     if not trades:
-        return pd.DataFrame(columns=["Entry","Exit","EntryPx","ExitPx","Return","Days"])
+        return pd.DataFrame(columns=["Entry", "Exit", "EntryPx", "ExitPx", "Return", "Days"])
 
-    tdf = pd.DataFrame(trades, columns=["Entry","Exit","EntryPx","ExitPx","Return"])
+    tdf = pd.DataFrame(trades, columns=["Entry", "Exit", "EntryPx", "ExitPx", "Return"])
     tdf["Days"] = (tdf["Exit"] - tdf["Entry"]).dt.days
     return tdf
 
@@ -395,7 +413,7 @@ def run_backtest(df: pd.DataFrame, pos: pd.Series, fee_bps: float, slippage_bps:
 
 
 # ============================================================
-# Strategies
+# Strategies (long/flat)
 # ============================================================
 def strat_buyhold(df, **params):
     return pd.Series(1.0, index=df.index)
@@ -463,14 +481,16 @@ def strat_donchian_breakout(df, n=20, **params):
 STRATEGIES = {
     "Buy & Hold": {"fn": strat_buyhold, "desc": "항상 보유(기준선).", "params": []},
     "SMA Crossover": {
-        "fn": strat_sma_cross, "desc": "FAST SMA > SLOW SMA이면 보유.",
+        "fn": strat_sma_cross,
+        "desc": "FAST SMA > SLOW SMA이면 보유.",
         "params": [
             dict(name="fast", label="FAST SMA", kind="int", min=5, max=200, step=1, default=20),
             dict(name="slow", label="SLOW SMA", kind="int", min=10, max=400, step=1, default=60),
         ],
     },
     "MACD Trend": {
-        "fn": strat_macd_trend, "desc": "MACD > Signal이면 보유.",
+        "fn": strat_macd_trend,
+        "desc": "MACD > Signal이면 보유.",
         "params": [
             dict(name="fast", label="MACD fast EMA", kind="int", min=3, max=50, step=1, default=12),
             dict(name="slow", label="MACD slow EMA", kind="int", min=10, max=120, step=1, default=26),
@@ -478,7 +498,8 @@ STRATEGIES = {
         ],
     },
     "RSI Mean Reversion": {
-        "fn": strat_rsi_reversion, "desc": "RSI<LOW면 진입, RSI>HIGH면 청산.",
+        "fn": strat_rsi_reversion,
+        "desc": "RSI<LOW면 진입, RSI>HIGH면 청산.",
         "params": [
             dict(name="n", label="RSI period", kind="int", min=5, max=50, step=1, default=14),
             dict(name="low", label="Entry (LOW)", kind="int", min=5, max=45, step=1, default=30),
@@ -486,14 +507,16 @@ STRATEGIES = {
         ],
     },
     "Bollinger Mean Reversion": {
-        "fn": strat_bollinger_reversion, "desc": "하단밴드 이탈 진입, 중단선 회귀 청산.",
+        "fn": strat_bollinger_reversion,
+        "desc": "하단밴드 이탈 진입, 중단선 회귀 청산.",
         "params": [
             dict(name="n", label="BB period", kind="int", min=5, max=60, step=1, default=20),
             dict(name="k", label="Std multiplier (k)", kind="float", min=1.0, max=4.0, step=0.1, default=2.0),
         ],
     },
     "Donchian Breakout": {
-        "fn": strat_donchian_breakout, "desc": "채널 상단 돌파 진입, 하단 이탈 청산.",
+        "fn": strat_donchian_breakout,
+        "desc": "채널 상단 돌파 진입, 하단 이탈 청산.",
         "params": [dict(name="n", label="Donchian window", kind="int", min=5, max=120, step=1, default=20)],
     },
 }
@@ -546,6 +569,7 @@ def latest_signal_from_pos(pos: pd.Series):
         return "—", "Not enough data."
     prev_pos = int(pos.iloc[-2])
     last_pos = int(pos.iloc[-1])
+
     if prev_pos == 0 and last_pos == 1:
         return "BUY", "0→1 (현금→보유)"
     if prev_pos == 1 and last_pos == 0:
@@ -561,6 +585,7 @@ def latest_signal_from_pos(pos: pd.Series):
 st.set_page_config(page_title="KR Strategy Backtester", layout="wide")
 st.title("📈 Korea Stock Strategy Backtester (KRX only)")
 
+# -------- Sidebar / Settings --------
 with st.sidebar:
     st.header("Cache")
     if st.button("Clear cache"):
@@ -568,43 +593,37 @@ with st.sidebar:
         st.success("Cache cleared")
 
     st.divider()
+    st.header("종목명 테이블 자동/오프라인")
+    st.caption("네트워크가 막혀 자동 다운로드가 실패해도, 로컬/업로드 CSV로 한글 검색이 됩니다.")
+
+    auto_update = st.checkbox("앱 실행 시 자동으로 KRX 테이블 업데이트 시도", value=True)
+    max_age_days = st.number_input("로컬 캐시 유효기간(일)", 1, 30, 7, 1)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        force_update = st.button("지금 다운로드/갱신")
+    with col2:
+        st.write("캐시:", str(KRX_CACHE_PATH))
+
+    uploaded_tbl = st.file_uploader(
+        "CSV 업로드 (컬럼: Name, Symbol)",
+        type=["csv"],
+        accept_multiple_files=False
+    )
+
+    template = pd.DataFrame(
+        [{"Name": "삼성전자", "Symbol": "005930"}, {"Name": "SK하이닉스", "Symbol": "000660"}]
+    )
+    st.download_button(
+        "템플릿 CSV 다운로드(형식)",
+        data=template.to_csv(index=False).encode("utf-8-sig"),
+        file_name="krx_symbols_template.csv",
+        mime="text/csv",
+    )
+
+    st.divider()
     st.header("종목 입력")
     stock_input = st.text_input("6자리 코드 또는 한글 종목명", value="삼성전자")
-
-    code6, chosen_name, candidates = resolve_kr_input_to_code(stock_input)
-
-    with st.expander("Debug (문제 해결용)", expanded=True):
-        st.write("FDR_OK:", FDR_OK, "| PYKRX_OK:", PYKRX_OK, "| REQ_OK:", REQ_OK)
-        df_fdr = krx_listing_fdr()
-        st.write("FDR listing is None?:", df_fdr is None)
-        df_kind = krx_listing_kind()
-        st.write("KIND listing is None?:", df_kind is None)
-        tbl = krx_name_table()
-        st.write("Name table rows:", 0 if (tbl is None) else len(tbl))
-        st.write("Input normalized:", normalize_name(stock_input))
-
-    # 종목명 테이블이 없으면 한글 검색 불가능(팩트) → 코드 입력만 유도
-    tbl_now = krx_name_table()
-    if (tbl_now is None) or (len(tbl_now) == 0):
-        st.warning(
-            "현재 환경에서 KRX 종목명 테이블을 가져오지 못했습니다.\n"
-            "한글 검색은 불가능하며(데이터 0개), 6자리 종목코드로만 입력 가능합니다.\n"
-            "해결: pykrx 설치(추천) 또는 requests/lxml/html5lib/bs4 설치 후 Clear cache."
-        )
-
-    if code6 is None:
-        if candidates is None or candidates.empty:
-            st.info("종목코드를 알고 있으면 6자리로 입력하세요. 예: 삼성전자 = 005930")
-            st.stop()
-
-        if len(candidates) == 1:
-            code6 = candidates.iloc[0]["Symbol"]
-            chosen_name = candidates.iloc[0]["Name"]
-        else:
-            options = (candidates["Symbol"] + " — " + candidates["Name"]).tolist()
-            pick = st.selectbox("검색 결과(여러 개면 선택)", options)
-            code6 = pick.split(" — ")[0].strip()
-            chosen_name = pick.split(" — ")[1].strip()
 
     st.divider()
     st.header("기간")
@@ -616,7 +635,6 @@ with st.sidebar:
     else:
         st.warning("날짜 범위를 시작/끝 2개 모두 선택해주세요.")
         st.stop()
-
     if start_d > end_d:
         st.error("Start date must be <= end date.")
         st.stop()
@@ -624,13 +642,13 @@ with st.sidebar:
     st.divider()
     st.header("데이터 소스 (KRX)")
     sources = []
-    # pykrx가 있으면 pykrx 우선
-    if PYKRX_OK: sources.append("pykrx (KRX)")
-    if FDR_OK: sources.append("FinanceDataReader (KRX)")
+    if PYKRX_OK:
+        sources.append("pykrx (KRX)")
+    if FDR_OK:
+        sources.append("FinanceDataReader (KRX)")
     if not sources:
         st.error("데이터 소스가 없습니다. pykrx / finance-datareader 중 하나 설치하세요.")
         st.stop()
-
     source = st.selectbox("Data Source", sources)
     adjusted = st.checkbox("Adjusted price (if supported)", value=True)
 
@@ -647,7 +665,6 @@ with st.sidebar:
     if mode == "Single Strategy":
         strat_name = st.selectbox("Choose Strategy", list(STRATEGIES.keys()))
         st.caption(STRATEGIES[strat_name]["desc"])
-
         params = {}
         with st.expander("Parameters", expanded=True):
             for p in STRATEGIES[strat_name]["params"]:
@@ -663,13 +680,108 @@ with st.sidebar:
         selected = st.multiselect(
             "Select strategies to compare",
             list(STRATEGIES.keys()),
-            default=["Buy & Hold", "SMA Crossover", "MACD Trend", "RSI Mean Reversion"]
+            default=["Buy & Hold", "SMA Crossover", "MACD Trend", "RSI Mean Reversion"],
         )
         strat_name = None
         params = None
 
     st.divider()
     run = st.button("Run", type="primary")
+
+
+# -------- Build symbol table (Auto download -> Local cache -> Upload -> Online(FDR/pykrx) -> Built-in) --------
+sym_source = "None"
+debug_err = {}
+
+# 0) 강제 다운로드/갱신 버튼
+if force_update:
+    try:
+        df_kind = download_kind_to_df(timeout=20)
+        save_df_to_cache_csv(df_kind, KRX_CACHE_PATH)
+        sym_source = "KIND download (forced)"
+    except Exception as e:
+        debug_err["KIND(forced)"] = traceback.format_exc()
+
+# 1) 자동 업데이트(캐시 오래됐으면 다운로드 시도)
+if sym_source == "None" and auto_update:
+    if not cache_is_fresh(KRX_CACHE_PATH, int(max_age_days)):
+        try:
+            df_kind = download_kind_to_df(timeout=20)
+            save_df_to_cache_csv(df_kind, KRX_CACHE_PATH)
+            sym_source = "KIND download (auto)"
+        except Exception:
+            debug_err["KIND(auto)"] = traceback.format_exc()
+
+# 2) 로컬 캐시가 있으면 로드
+symtbl = pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
+if KRX_CACHE_PATH.exists():
+    try:
+        symtbl = load_symbol_table_from_local_csv(str(KRX_CACHE_PATH))
+        if not symtbl.empty and sym_source == "None":
+            sym_source = "Local cache krx_symbols.csv"
+    except Exception:
+        debug_err["Local cache load"] = traceback.format_exc()
+
+# 3) 업로드 CSV
+if symtbl.empty and uploaded_tbl is not None:
+    try:
+        symtbl = load_symbol_table_from_csv_bytes(uploaded_tbl.getvalue())
+        if not symtbl.empty:
+            sym_source = "Upload CSV"
+    except Exception:
+        debug_err["Upload CSV load"] = traceback.format_exc()
+
+# 4) 온라인 fallback: FDR / pykrx (네트워크 막히면 비게 됨)
+if symtbl.empty:
+    df_fdr = try_fdr_symbol_table()
+    if not df_fdr.empty:
+        symtbl = df_fdr
+        sym_source = "FDR StockListing(KRX)"
+    else:
+        df_px = try_pykrx_symbol_table()
+        if not df_px.empty:
+            symtbl = df_px
+            sym_source = "pykrx ticker list"
+
+# 5) 마지막: 내장 최소 테이블
+if symtbl.empty:
+    symtbl = built_in_min_table()
+    sym_source = "Built-in (limited)"
+
+
+# Debug panel (main area)
+with st.expander("Debug (문제 해결용)", expanded=False):
+    st.write("FDR_OK:", FDR_OK, "| PYKRX_OK:", PYKRX_OK, "| REQ_OK:", REQ_OK)
+    st.write("Symbol table source:", sym_source)
+    st.write("Name table rows:", len(symtbl))
+    st.write("Cache exists:", KRX_CACHE_PATH.exists())
+    if KRX_CACHE_PATH.exists():
+        st.write("Cache mtime:", time.ctime(KRX_CACHE_PATH.stat().st_mtime))
+    if debug_err:
+        for k, v in debug_err.items():
+            st.subheader(k)
+            st.code(v)
+    st.write("Input normalized:", normalize_name(stock_input))
+
+
+# Resolve input to code
+code6, chosen_name, candidates = resolve_input_to_code(symtbl, stock_input)
+
+if code6 is None:
+    if candidates is not None and not candidates.empty:
+        if len(candidates) == 1:
+            code6 = candidates.iloc[0]["Symbol"]
+            chosen_name = candidates.iloc[0]["Name"]
+        else:
+            options = (candidates["Symbol"] + " — " + candidates["Name"]).tolist()
+            pick = st.sidebar.selectbox("검색 결과(여러 개면 선택)", options)
+            code6 = pick.split(" — ")[0].strip()
+            chosen_name = pick.split(" — ")[1].strip()
+    else:
+        if sym_source == "Built-in (limited)":
+            st.warning("현재는 내장된 일부 종목만 한글 검색이 됩니다. (전체 종목은 CSV 업로드 또는 캐시 다운로드 성공 필요)")
+        st.info("한글 검색이 안 되면 6자리 종목코드를 직접 입력하세요. 예: 삼성전자 = 005930")
+        st.stop()
 
 
 def load_korea_data(code6_: str):
@@ -681,6 +793,9 @@ def load_korea_data(code6_: str):
     return df, f"{display} ({code6_}) — FDR"
 
 
+# ============================================================
+# Run
+# ============================================================
 if run:
     df, title = load_korea_data(code6)
     df = ensure_ohlcv(df)
@@ -726,6 +841,7 @@ if run:
             )
         with tab4:
             st.dataframe(pd.DataFrame([metrics]).T.rename(columns={0: "Value"}))
+
     else:
         if not selected:
             st.warning("Select at least one strategy.")
