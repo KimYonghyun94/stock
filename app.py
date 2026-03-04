@@ -4,9 +4,11 @@ import numpy as np
 from datetime import date, timedelta
 import plotly.graph_objects as go
 import contextlib, io, logging
+import requests
+from io import StringIO
 
 # -----------------------------
-# Optional dependencies
+# Optional deps
 # -----------------------------
 try:
     import yfinance as yf
@@ -15,7 +17,7 @@ except Exception:
     YF_OK = False
 
 try:
-    import FinanceDataReader as fdr  # pip name: finance-datareader
+    import FinanceDataReader as fdr  # pip: finance-datareader
     FDR_OK = True
 except Exception:
     FDR_OK = False
@@ -26,18 +28,16 @@ try:
 except Exception:
     PYKRX_OK = False
 
-# quiet noisy logs
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-# ============================================================
-# Streamlit plotly helper (new width="stretch" + fallback)
-# ============================================================
+# -----------------------------
+# Plotly helper (new width API + backward fallback)
+# -----------------------------
 def st_plotly(fig, stretch=True):
     try:
         st.plotly_chart(fig, width="stretch" if stretch else "content")
     except TypeError:
-        # older Streamlit fallback
         st.plotly_chart(fig, use_container_width=stretch)
 
 # ============================================================
@@ -80,7 +80,7 @@ def annualized_vol(close: pd.Series, window: int = 20, ann: int = 252) -> pd.Ser
     return close.pct_change().rolling(window).std() * np.sqrt(ann)
 
 # ============================================================
-# Data fetch (cached)
+# Data fetch
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def krx_listing():
@@ -102,45 +102,69 @@ def infer_yahoo_suffix(code6: str, listing_df: pd.DataFrame | None):
     market = str(hit.iloc[0].get("Market", "")).upper()
     return ".KQ" if "KOSDAQ" in market else ".KS"
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_stooq_us_daily_csv(ticker: str, start: date, end: date) -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner=False)  # 실패 결과가 오래 캐시되지 않게 5분
+def fetch_stooq_us_daily_csv(ticker: str, start: date, end: date):
     """
-    US via Stooq direct CSV:
-      https://stooq.com/q/d/l/?s=aapl.us&i=d
+    US via Stooq direct CSV with headers + domain fallback.
+    Returns: (df, meta)
     """
-    sym = ticker.strip().lower()
-    if not sym.endswith(".us"):
-        sym = f"{sym}.us"
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    # BRK-B -> BRK.B 같은 케이스 대비
+    sym = ticker.strip().upper().replace("-", ".")
+    if not sym.endswith(".US"):
+        sym = f"{sym}.US"
 
-    try:
-        df = pd.read_csv(url)
-        if df is None or df.empty or "Date" not in df.columns:
-            return pd.DataFrame()
+    bases = ["https://stooq.com", "https://stooq.pl"]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; StockApp/1.0; +https://example.com)",
+        "Accept": "text/csv,text/plain;q=0.9,*/*;q=0.8",
+    }
 
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    attempts = []
+    start_ts = pd.to_datetime(start)
+    end_ts = pd.to_datetime(end)
 
-        need = ["Open", "High", "Low", "Close"]
-        if not set(need).issubset(df.columns):
-            return pd.DataFrame()
+    for base in bases:
+        url = f"{base}/q/d/l/?s={sym}&i=d"
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            head = (r.text or "")[:120].replace("\n", "\\n")
+            attempts.append(f"{url} -> status={r.status_code}, head={head}")
 
-        if "Volume" not in df.columns:
-            df["Volume"] = 0
+            if r.status_code != 200:
+                continue
 
-        # filter requested range (end inclusive)
-        start_ts = pd.to_datetime(start)
-        end_ts = pd.to_datetime(end)
-        df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
+            text = (r.text or "").lstrip()
+            # CSV 여부 체크
+            if not text.startswith("Date,Open,High,Low,Close"):
+                continue
 
-        out = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return out
-    except Exception:
-        return pd.DataFrame()
+            df = pd.read_csv(StringIO(text))
+            if df is None or df.empty or "Date" not in df.columns:
+                continue
+
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+
+            need = {"Open", "High", "Low", "Close"}
+            if not need.issubset(df.columns):
+                continue
+            if "Volume" not in df.columns:
+                df["Volume"] = 0
+
+            df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+            meta = {"ok": True, "used_url": url, "attempts": attempts[-3:]}
+            return df, meta
+
+        except Exception as e:
+            attempts.append(f"{url} -> EXCEPTION: {type(e).__name__}: {e}")
+
+    return pd.DataFrame(), {"ok": False, "attempts": attempts}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_yfinance_daily(symbol: str, start: date, end: date, auto_adjust: bool = True) -> pd.DataFrame:
-    """Daily OHLCV via yfinance. May rate-limit on shared IP environments."""
+    """Daily OHLCV via yfinance (may rate-limit on Streamlit Cloud)."""
     if not YF_OK:
         return pd.DataFrame()
     try:
@@ -462,6 +486,20 @@ STRATEGY_SPECS = {
     },
 }
 
+def build_params_ui(strategy_name: str):
+    spec = STRATEGY_SPECS[strategy_name]
+    params = {}
+    for p in spec["params"]:
+        if p["kind"] == "int":
+            params[p["name"]] = st.slider(
+                p["label"], int(p["min"]), int(p["max"]), int(p["default"]), int(p["step"])
+            )
+        else:
+            params[p["name"]] = st.slider(
+                p["label"], float(p["min"]), float(p["max"]), float(p["default"]), float(p["step"])
+            )
+    return params
+
 # ============================================================
 # Plotting
 # ============================================================
@@ -507,77 +545,25 @@ def plot_drawdown(equity: pd.Series, title: str):
     return fig
 
 # ============================================================
-# Strategy param UI (with Presets)
-# ============================================================
-def presets_for(name: str):
-    base = STRATEGY_SPECS[name]["defaults"].copy()
-    cons = base.copy()
-    aggr = base.copy()
-
-    # light preset tweaks
-    if name == "SMA Crossover":
-        cons = {"fast": 50, "slow": 200}
-        aggr = {"fast": 10, "slow": 30}
-    elif name == "EMA Crossover":
-        cons = {"fast": 24, "slow": 52}
-        aggr = {"fast": 6, "slow": 18}
-    elif name == "RSI Mean Reversion":
-        cons = {"n": 20, "low": 25, "high": 65}
-        aggr = {"n": 10, "low": 35, "high": 75}
-    elif name == "Bollinger Mean Reversion":
-        cons = {"n": 30, "k": 2.5}
-        aggr = {"n": 15, "k": 1.8}
-    elif name == "Donchian Breakout":
-        cons = {"n": 55}
-        aggr = {"n": 10}
-    elif name == "MACD Trend":
-        cons = {"fast": 12, "slow": 39, "signal": 9}
-        aggr = {"fast": 6, "slow": 18, "signal": 6}
-    elif name == "Momentum + SMA Filter":
-        cons = {"lookback": 252, "sma_filter": 200}
-        aggr = {"lookback": 60, "sma_filter": 100}
-    elif name == "Trend + Vol Cap":
-        cons = {"fast": 50, "slow": 200, "vol_window": 20, "vol_cap": 0.25}
-        aggr = {"fast": 10, "slow": 30, "vol_window": 10, "vol_cap": 0.40}
-
-    return {"Default": base, "Conservative": cons, "Aggressive": aggr}
-
-def build_params_ui(strategy_name: str):
-    spec = STRATEGY_SPECS[strategy_name]
-    params = {}
-
-    presets = presets_for(strategy_name)
-    preset_choice = st.radio("Preset", ["Default", "Conservative", "Aggressive"], horizontal=True)
-    base = presets[preset_choice]
-
-    for p in spec["params"]:
-        name = p["name"]
-        label = p["label"]
-        kind = p["kind"]
-        default = base.get(name, p.get("default"))
-
-        if kind == "int":
-            params[name] = st.slider(label, int(p["min"]), int(p["max"]), int(default), int(p["step"]))
-        else:
-            params[name] = st.slider(label, float(p["min"]), float(p["max"]), float(default), float(p["step"]))
-
-    return params
-
-# ============================================================
-# App UI
+# UI
 # ============================================================
 st.set_page_config(page_title="KR/US Strategy Backtester", layout="wide")
 st.title("📊 KR/US Stock Strategy Backtester")
 
 with st.sidebar:
+    st.header("Cache")
+    if st.button("Clear cache"):
+        st.cache_data.clear()
+        st.success("Cache cleared")
+
+    st.divider()
     st.header("Data")
     market = st.selectbox("Market", ["US (미국)", "Korea (한국)"])
 
     today = date.today()
     start_default = today - timedelta(days=365 * 3)
-
-    # SAFE date range handling
     date_range = st.date_input("Date Range", value=[start_default, today], max_value=today)
+
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         start_d, end_d = date_range
     else:
@@ -602,10 +588,10 @@ with st.sidebar:
     listing_df = krx_listing() if market.startswith("Korea") else None
 
     if market.startswith("US"):
-        us_ticker = st.text_input("US Ticker (e.g., AAPL, MSFT, NVDA)", value="AAPL").strip()
-        # yfinance fallback is optional; default OFF
+        us_ticker = st.text_input("US Ticker (e.g., AAPL, MSFT, NVDA, BRK-B)", value="AAPL").strip()
+        show_us_debug = st.checkbox("Show US fetch debug", value=True)
         use_yf_fallback = st.checkbox("If Stooq fails, try yfinance (may rate limit)", value=False)
-        yf_auto_adj = st.checkbox("yfinance auto-adjust (splits/dividends)", value=True)
+        yf_auto_adj = st.checkbox("yfinance auto-adjust", value=True)
     else:
         sources = []
         if PYKRX_OK: sources.append("pykrx (KRX)")
@@ -641,19 +627,25 @@ with st.sidebar:
     else:
         default_sel = ["Buy & Hold", "SMA Crossover", "MACD Trend", "RSI Mean Reversion"]
         selected = st.multiselect("Select strategies to compare", list(STRATEGY_SPECS.keys()), default=default_sel)
-        st.caption("Compare 모드는 각 전략의 Default 파라미터로 빠르게 비교합니다.")
+        st.caption("Compare 모드는 각 전략의 Default 파라미터로 비교합니다.")
 
     st.divider()
     run = st.button("Run Backtest", type="primary")
 
 def load_data():
     if market.startswith("US"):
-        ticker = us_ticker.upper()
-        df = fetch_stooq_us_daily_csv(ticker, start_d, end_d)
+        ticker = us_ticker.upper().strip()
+        df, meta = fetch_stooq_us_daily_csv(ticker, start_d, end_d)
         src = "stooq(csv)"
 
-        # optional fallback
+        # debug (optional)
+        if show_us_debug:
+            with st.expander("US fetch debug (Stooq)"):
+                st.write(meta)
+
+        # optional yfinance fallback
         if df.empty and use_yf_fallback and YF_OK:
+            st.warning("Stooq 실패 → yfinance fallback 시도 중… (레이트리밋 가능)")
             df2 = fetch_yfinance_daily(ticker, start_d, end_d, auto_adjust=yf_auto_adj)
             if not df2.empty:
                 df, src = df2, "yfinance"
@@ -686,15 +678,11 @@ if run:
     df = ensure_ohlcv(df)
 
     if df.empty:
-        if market.startswith("US"):
-            st.error(
-                "미국 주식 데이터를 가져오지 못했습니다.\n"
-                "- 기본은 Stooq CSV인데, 네트워크/차단/심볼 미지원이면 빈 데이터가 올 수 있어요.\n"
-                "- yfinance fallback을 켜면, 지금 네 로그처럼 RateLimit 에러가 날 수 있습니다.\n"
-                "테스트 티커: AAPL, MSFT, NVDA"
-            )
-        else:
-            st.error("한국 주식 데이터를 가져오지 못했습니다. (코드/소스/기간 확인)")
+        st.error(
+            "데이터를 가져오지 못했습니다.\n"
+            "- US: Stooq 응답이 CSV가 아니거나(차단/HTML), 네트워크가 막히면 빈 데이터가 올 수 있어요.\n"
+            "- yfinance fallback은 Streamlit Cloud에서 레이트리밋으로 실패할 수 있어요."
+        )
         st.stop()
 
     st.success(f"Loaded {len(df):,} rows | {base_title}")
@@ -774,7 +762,4 @@ if run:
         st.dataframe(res_df.sort_values(by=sort_key, ascending=False, na_position="last"))
 
 else:
-    st.info(
-        "왼쪽에서 Market/종목/기간/전략을 고르고 **Run Backtest**를 누르세요.\n\n"
-        "미국은 기본이 Stooq CSV이고, yfinance는 선택(fallback)입니다."
-    )
+    st.info("왼쪽에서 Market/종목/기간/전략을 고르고 **Run Backtest**를 누르세요.")
