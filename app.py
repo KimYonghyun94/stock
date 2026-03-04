@@ -5,8 +5,10 @@ from datetime import date, timedelta
 import plotly.graph_objects as go
 import re
 import unicodedata
+from difflib import SequenceMatcher
+
 # Optional deps (KR only)
-try:f
+try:
     import FinanceDataReader as fdr  # pip name: finance-datareader
     FDR_OK = True
 except Exception:
@@ -27,6 +29,27 @@ def st_plotly(fig, stretch=True):
         st.plotly_chart(fig, width="stretch" if stretch else "content")
     except TypeError:
         st.plotly_chart(fig, use_container_width=stretch)
+
+
+# ============================================================
+# Text normalization (Korean search robustness)
+# ============================================================
+def normalize_name(x: str) -> str:
+    """
+    Normalize stock name for robust matching:
+    - NFKC normalize
+    - strip, collapse whitespace
+    - remove whitespace + punctuation/symbols (keep Korean/English/digits/_)
+    """
+    x = unicodedata.normalize("NFKC", str(x))
+    x = x.strip()
+    x = re.sub(r"\s+", "", x)
+    x = re.sub(r"[^\w가-힣]", "", x)  # keep: Korean + word chars (A-Z a-z 0-9 _)
+    return x
+
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
 
 
 # ============================================================
@@ -65,12 +88,9 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     h = m - s
     return m, s, h
 
-def annualized_vol(close: pd.Series, window: int = 20, ann: int = 252) -> pd.Series:
-    return close.pct_change().rolling(window).std() * np.sqrt(ann)
-
 
 # ============================================================
-# KRX name table / resolver (한글 종목명 -> 6자리 코드)
+# KRX listing / name table
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def krx_listing():
@@ -78,71 +98,115 @@ def krx_listing():
     if not FDR_OK:
         return None
     try:
-        return fdr.StockListing("KRX")
+        df = fdr.StockListing("KRX")
+        return df
     except Exception:
         return None
-
-
-
-def _norm_name(x: str) -> str:
-    x = unicodedata.normalize("NFKC", str(x))
-    x = x.strip()
-    x = re.sub(r"\s+", "", x)          # 모든 공백 제거
-    x = re.sub(r"[^\w가-힣]", "", x)   # 한글/영문/숫자/_(underscore)만 남김
-    return x
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def krx_name_table():
-    ...
-    # out 또는 df 만들고 나서, return 직전에 추가
-    out["NameNorm"] = out["Name"].map(_norm_name)
-    return out.drop_duplicates()
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def krx_name_table():
     """
     Name<->Symbol table.
     Prefer FinanceDataReader, fallback to pykrx.
+    Always add NameNorm for robust Korean search.
     """
     # 1) FDR
     if FDR_OK:
         df = krx_listing()
-        if df is not None and ("Name" in df.columns) and ("Symbol" in df.columns):
+        if df is not None and not df.empty and ("Name" in df.columns) and ("Symbol" in df.columns):
             out = df[["Name", "Symbol"]].copy()
-            out["Name"] = out["Name"].astype(str)
-            out["Symbol"] = out["Symbol"].astype(str).str.zfill(6)
+            out["Name"] = out["Name"].astype(str).map(lambda x: unicodedata.normalize("NFKC", x).strip())
+            out["Symbol"] = out["Symbol"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(6)
+            out = out.dropna()
+            out = out[out["Symbol"].str.len() == 6]
+            out["NameNorm"] = out["Name"].map(normalize_name)
             return out.drop_duplicates()
 
     # 2) pykrx fallback
     if PYKRX_OK:
-        codes = krx_stock.get_market_ticker_list(market="ALL")
-        rows = []
-        for c in codes:
-            nm = krx_stock.get_market_ticker_name(c)
-            rows.append((str(nm), str(c).zfill(6)))
-        return pd.DataFrame(rows, columns=["Name", "Symbol"]).drop_duplicates()
+        try:
+            codes = krx_stock.get_market_ticker_list(market="ALL")
+            rows = []
+            for c in codes:
+                nm = krx_stock.get_market_ticker_name(c)
+                nm = unicodedata.normalize("NFKC", str(nm)).strip()
+                rows.append((nm, str(c).zfill(6)))
+            out = pd.DataFrame(rows, columns=["Name", "Symbol"]).drop_duplicates()
+            out["NameNorm"] = out["Name"].map(normalize_name)
+            return out
+        except Exception:
+            return None
 
     return None
 
 
-def resolve_kr_input_to_code(user_input: str):
+def search_krx_candidates(user_input: str, topn: int = 50) -> pd.DataFrame:
+    """
+    Return candidates DataFrame with columns [Name, Symbol, NameNorm].
+    Search order:
+      1) exact match on normalized
+      2) contains on original (regex=False)
+      3) contains on normalized (regex=False)
+      4) fuzzy 추천 (유사도 상위)
+    """
     s = (user_input or "").strip()
+    tbl = krx_name_table()
+    if tbl is None or tbl.empty or not s:
+        return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
+
+    sn = normalize_name(s)
+
+    # 1) exact match (normalized)
+    exact = tbl[tbl["NameNorm"] == sn].copy()
+    if not exact.empty:
+        return exact.head(topn)
+
+    # 2) contains original (regex OFF)
+    hits1 = tbl[tbl["Name"].str.contains(s, na=False, regex=False)].copy()
+
+    # 3) contains normalized (regex OFF)
+    hits2 = tbl[tbl["NameNorm"].str.contains(sn, na=False, regex=False)].copy()
+
+    hits = pd.concat([hits1, hits2], ignore_index=True).drop_duplicates()
+    if not hits.empty:
+        return hits.head(topn)
+
+    # 4) fuzzy 추천 (상위 topn)
+    # 너무 짧은 입력(한 글자 등)은 추천이 의미 없을 수 있어서 길이 조건
+    if len(sn) < 2:
+        return pd.DataFrame(columns=["Name", "Symbol", "NameNorm"])
+
+    # compute similarity on NameNorm
+    tmp = tbl[["Name", "Symbol", "NameNorm"]].copy()
+    tmp["score"] = tmp["NameNorm"].map(lambda x: similarity(sn, x))
+    tmp = tmp.sort_values("score", ascending=False)
+    tmp = tmp[tmp["score"] >= 0.5].head(topn)  # 임계값: 0.5 (너무 낮으면 잡음 많음)
+    return tmp.drop(columns=["score"], errors="ignore")
+
+
+def resolve_kr_input_to_code(user_input: str):
+    """
+    Input can be:
+      - 6-digit code: "005930"
+      - Korean name: "삼성전자"
+    Returns:
+      (code6, chosen_name, candidates_df)
+    """
+    s = (user_input or "").strip()
+
+    # code direct
     if s.isdigit() and len(s) == 6:
         return s, None, None
 
-    tbl = krx_name_table()
-    if tbl is None or tbl.empty:
-        return None, None, None
+    candidates = search_krx_candidates(s, topn=80)
+    if candidates is None or candidates.empty:
+        return None, None, candidates
 
-    # 1차: 원문 contains (정규식 OFF)
-    hits = tbl[tbl["Name"].str.contains(s, na=False, regex=False)].copy()
+    # if a single candidate, auto-pick
+    if len(candidates) == 1:
+        return candidates.iloc[0]["Symbol"], candidates.iloc[0]["Name"], candidates
 
-    # 2차: 정규화 검색 (공백/특수문자 제거)
-    if hits.empty:
-        sn = _norm_name(s)
-        hits = tbl[tbl["NameNorm"].str.contains(sn, na=False, regex=False)].copy()
-
-    return None, None, hits
+    return None, None, candidates
 
 
 # ============================================================
@@ -448,7 +512,7 @@ def plot_drawdown(equity: pd.Series, title: str):
 # ============================================================
 # Latest Signal helper
 # ============================================================
-def latest_signal_from_pos(pos: pd.Series) -> tuple[str, str]:
+def latest_signal_from_pos(pos: pd.Series):
     pos = pos.dropna()
     if len(pos) < 2:
         return "—", "Not enough data."
@@ -474,26 +538,31 @@ with st.sidebar:
     st.header("Cache")
     if st.button("Clear cache"):
         st.cache_data.clear()
-        st.success("Cache cleared")
-    
+        st.success("Cache cleared (종목명 테이블도 새로 로딩됩니다)")
+
     st.divider()
     st.header("종목 입력")
     stock_input = st.text_input("6자리 코드 또는 한글 종목명", value="삼성전자")
 
     code6, chosen_name, candidates = resolve_kr_input_to_code(stock_input)
 
+    # 디버그(원하면 지워도 됨): 한글 검색이 안 될 때 원인 확인용 팩트 출력
+    with st.expander("Debug (문제 해결용)", expanded=False):
+        st.write("FDR_OK:", FDR_OK, "| PYKRX_OK:", PYKRX_OK)
+        tbl = krx_name_table()
+        st.write("Name table rows:", 0 if (tbl is None) else len(tbl))
+        st.write("Input normalized:", normalize_name(stock_input))
+
     if code6 is None:
-        if candidates is None:
-            st.error("종목명 테이블을 만들 수 없습니다. (finance-datareader 또는 pykrx 필요)")
-            st.stop()
-        if candidates.empty:
-            st.error("종목명을 찾지 못했어요. (오타/띄어쓰기 확인)")
+        if candidates is None or candidates.empty:
+            st.error("종목명을 찾지 못했어요. (오타/띄어쓰기/우선주 표기 확인)  \n또는 종목명 테이블 로딩 실패일 수 있어요 → Clear cache 눌러보세요.")
             st.stop()
 
         if len(candidates) == 1:
             code6 = candidates.iloc[0]["Symbol"]
             chosen_name = candidates.iloc[0]["Name"]
         else:
+            # 검색 결과가 여러 개면 선택하게
             options = (candidates["Symbol"] + " — " + candidates["Name"]).tolist()
             pick = st.selectbox("검색 결과(여러 개면 선택)", options)
             code6 = pick.split(" — ")[0].strip()
@@ -519,7 +588,6 @@ with st.sidebar:
     sources = []
     if PYKRX_OK: sources.append("pykrx (KRX)")
     if FDR_OK: sources.append("FinanceDataReader (KRX)")
-
     if not sources:
         st.error("데이터 소스가 없습니다. pykrx / finance-datareader 중 하나 설치하세요.")
         st.stop()
@@ -563,15 +631,13 @@ with st.sidebar:
 
     st.divider()
     run = st.button("Run", type="primary")
-    st.write("FDR_OK:", FDR_OK, "PYKRX_OK:", PYKRX_OK)
-    st.write("name_table rows:", 0 if krx_name_table() is None else len(krx_name_table()))
+
 
 def load_korea_data(code6_: str):
     display = chosen_name or code6_
     if source.startswith("pykrx"):
         df = fetch_pykrx_daily(code6_, start_d, end_d, adjusted=adjusted)
         return df, f"{display} ({code6_}) — pykrx"
-    # FinanceDataReader
     df = fetch_fdr_korea_daily(code6_, start_d, end_d)
     return df, f"{display} ({code6_}) — FDR"
 
@@ -657,4 +723,4 @@ if run:
         st.dataframe(res_df.sort_values(by=sort_key, ascending=False, na_position="last"))
 
 else:
-    st.info("왼쪽에서 종목(한글/코드)과 기간/전략을 고르고 **Run**을 누르세요.")
+    st.info("왼쪽 사이드바에서 종목(한글/코드)과 기간/전략을 고르고 **Run**을 누르세요.")
