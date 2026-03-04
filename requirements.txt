@@ -5,3 +5,4 @@ plotly
 yfinance
 finance-datareader
 pykrx
+pandas-datareader
