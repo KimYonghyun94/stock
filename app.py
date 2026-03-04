@@ -4,7 +4,7 @@ import numpy as np
 from datetime import date, timedelta
 import plotly.graph_objects as go
 
-# Optional deps
+# Optional deps (KR only)
 try:
     import FinanceDataReader as fdr  # pip name: finance-datareader
     FDR_OK = True
@@ -16,12 +16,6 @@ try:
     PYKRX_OK = True
 except Exception:
     PYKRX_OK = False
-
-try:
-    import yfinance as yf
-    YF_OK = True
-except Exception:
-    YF_OK = False
 
 
 # -----------------------------
@@ -134,19 +128,8 @@ def resolve_kr_input_to_code(user_input: str):
     return None, None, hits
 
 
-def infer_yahoo_suffix(code6: str, listing_df: pd.DataFrame | None):
-    # default KOSPI
-    if listing_df is None:
-        return ".KS"
-    hit = listing_df[listing_df["Symbol"].astype(str) == str(code6)]
-    if len(hit) == 0:
-        return ".KS"
-    market = str(hit.iloc[0].get("Market", "")).upper()
-    return ".KQ" if "KOSDAQ" in market else ".KS"
-
-
 # ============================================================
-# Data fetch (Korea)
+# Data fetch (KRX only)
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fdr_korea_daily(code6: str, start: date, end: date) -> pd.DataFrame:
@@ -178,29 +161,6 @@ def fetch_pykrx_daily(code6: str, start: date, end: date, adjusted: bool = True)
         df = df.rename(columns={"시가":"Open","고가":"High","저가":"Low","종가":"Close","거래량":"Volume"})
         df.index.name = "Date"
         return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yfinance_korea_daily(code6: str, start: date, end: date, auto_adjust: bool, suffix: str) -> pd.DataFrame:
-    if not YF_OK:
-        return pd.DataFrame()
-    try:
-        sym = f"{code6}{suffix}"
-        df = yf.download(
-            sym,
-            start=str(start),
-            end=str(end + timedelta(days=1)),
-            interval="1d",
-            auto_adjust=auto_adjust,
-            progress=False,
-            threads=True,
-        )
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.rename_axis("Date")
-        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-        return df[keep].dropna()
     except Exception:
         return pd.DataFrame()
 
@@ -491,7 +451,7 @@ def latest_signal_from_pos(pos: pd.Series) -> tuple[str, str]:
 # App UI
 # ============================================================
 st.set_page_config(page_title="KR Strategy Backtester", layout="wide")
-st.title("📈 Korea Stock Strategy Backtester")
+st.title("📈 Korea Stock Strategy Backtester (KRX only)")
 
 with st.sidebar:
     st.header("Cache")
@@ -522,8 +482,6 @@ with st.sidebar:
             code6 = pick.split(" — ")[0].strip()
             chosen_name = pick.split(" — ")[1].strip()
 
-    listing_df = krx_listing()
-
     st.divider()
     st.header("기간")
     today = date.today()
@@ -540,14 +498,13 @@ with st.sidebar:
         st.stop()
 
     st.divider()
-    st.header("데이터 소스")
+    st.header("데이터 소스 (KRX)")
     sources = []
     if PYKRX_OK: sources.append("pykrx (KRX)")
     if FDR_OK: sources.append("FinanceDataReader (KRX)")
-    if YF_OK: sources.append("yfinance (Yahoo)")
 
     if not sources:
-        st.error("데이터 소스가 없습니다. pykrx / finance-datareader / yfinance 중 하나 설치하세요.")
+        st.error("데이터 소스가 없습니다. pykrx / finance-datareader 중 하나 설치하세요.")
         st.stop()
 
     source = st.selectbox("Data Source", sources)
@@ -596,13 +553,9 @@ def load_korea_data(code6_: str):
     if source.startswith("pykrx"):
         df = fetch_pykrx_daily(code6_, start_d, end_d, adjusted=adjusted)
         return df, f"{display} ({code6_}) — pykrx"
-    if source.startswith("FinanceDataReader"):
-        df = fetch_fdr_korea_daily(code6_, start_d, end_d)
-        return df, f"{display} ({code6_}) — FDR"
-    # yfinance
-    suffix = infer_yahoo_suffix(code6_, listing_df)
-    df = fetch_yfinance_korea_daily(code6_, start_d, end_d, auto_adjust=adjusted, suffix=suffix)
-    return df, f"{display} ({code6_}{suffix}) — yfinance"
+    # FinanceDataReader
+    df = fetch_fdr_korea_daily(code6_, start_d, end_d)
+    return df, f"{display} ({code6_}) — FDR"
 
 
 if run:
