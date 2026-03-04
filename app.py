@@ -1,7 +1,7 @@
 import pandas as pd
 from datetime import timedelta
 
-@st.cache_data(ttl=3600, show_spinner=False)
+
 def fetch_stooq_us_daily_csv(ticker: str, start, end) -> pd.DataFrame:
     """
     Stooq direct CSV:
