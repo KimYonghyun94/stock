@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 from datetime import date, timedelta
 import plotly.graph_objects as go
-
+import re
+import unicodedata
 # Optional deps (KR only)
 try:
     import FinanceDataReader as fdr  # pip name: finance-datareader
@@ -81,6 +82,22 @@ def krx_listing():
     except Exception:
         return None
 
+
+
+def _norm_name(x: str) -> str:
+    x = unicodedata.normalize("NFKC", str(x))
+    x = x.strip()
+    x = re.sub(r"\s+", "", x)          # 모든 공백 제거
+    x = re.sub(r"[^\w가-힣]", "", x)   # 한글/영문/숫자/_(underscore)만 남김
+    return x
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def krx_name_table():
+    ...
+    # out 또는 df 만들고 나서, return 직전에 추가
+    out["NameNorm"] = out["Name"].map(_norm_name)
+    return out.drop_duplicates()
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def krx_name_table():
     """
@@ -109,13 +126,6 @@ def krx_name_table():
 
 
 def resolve_kr_input_to_code(user_input: str):
-    """
-    Input can be:
-      - 6-digit code: "005930"
-      - Korean name: "삼성전자"
-    Returns:
-      (code6, chosen_name, candidates_df)
-    """
     s = (user_input or "").strip()
     if s.isdigit() and len(s) == 6:
         return s, None, None
@@ -124,7 +134,14 @@ def resolve_kr_input_to_code(user_input: str):
     if tbl is None or tbl.empty:
         return None, None, None
 
-    hits = tbl[tbl["Name"].str.contains(s, na=False)].copy()
+    # 1차: 원문 contains (정규식 OFF)
+    hits = tbl[tbl["Name"].str.contains(s, na=False, regex=False)].copy()
+
+    # 2차: 정규화 검색 (공백/특수문자 제거)
+    if hits.empty:
+        sn = _norm_name(s)
+        hits = tbl[tbl["NameNorm"].str.contains(sn, na=False, regex=False)].copy()
+
     return None, None, hits
 
 
