@@ -70,12 +70,16 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     h = m - s
     return m, s, h
 
+def annualized_vol(close: pd.Series, window: int = 20, ann: int = 252) -> pd.Series:
+    return close.pct_change().rolling(window).std() * np.sqrt(ann)
+
 
 # ============================================================
-# Data fetch (Korea)
+# KRX name table / resolver (한글 종목명 -> 6자리 코드)
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def krx_listing():
+    """KRX listing from FinanceDataReader (if available)."""
     if not FDR_OK:
         return None
     try:
@@ -83,6 +87,67 @@ def krx_listing():
     except Exception:
         return None
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def krx_name_table():
+    """
+    Name<->Symbol table.
+    Prefer FinanceDataReader, fallback to pykrx.
+    """
+    # 1) FDR
+    if FDR_OK:
+        df = krx_listing()
+        if df is not None and ("Name" in df.columns) and ("Symbol" in df.columns):
+            out = df[["Name", "Symbol"]].copy()
+            out["Name"] = out["Name"].astype(str)
+            out["Symbol"] = out["Symbol"].astype(str).str.zfill(6)
+            return out.drop_duplicates()
+
+    # 2) pykrx fallback
+    if PYKRX_OK:
+        codes = krx_stock.get_market_ticker_list(market="ALL")
+        rows = []
+        for c in codes:
+            nm = krx_stock.get_market_ticker_name(c)
+            rows.append((str(nm), str(c).zfill(6)))
+        return pd.DataFrame(rows, columns=["Name", "Symbol"]).drop_duplicates()
+
+    return None
+
+
+def resolve_kr_input_to_code(user_input: str):
+    """
+    Input can be:
+      - 6-digit code: "005930"
+      - Korean name: "삼성전자"
+    Returns:
+      (code6, chosen_name, candidates_df)
+    """
+    s = (user_input or "").strip()
+    if s.isdigit() and len(s) == 6:
+        return s, None, None
+
+    tbl = krx_name_table()
+    if tbl is None or tbl.empty:
+        return None, None, None
+
+    hits = tbl[tbl["Name"].str.contains(s, na=False)].copy()
+    return None, None, hits
+
+
+def infer_yahoo_suffix(code6: str, listing_df: pd.DataFrame | None):
+    # default KOSPI
+    if listing_df is None:
+        return ".KS"
+    hit = listing_df[listing_df["Symbol"].astype(str) == str(code6)]
+    if len(hit) == 0:
+        return ".KS"
+    market = str(hit.iloc[0].get("Market", "")).upper()
+    return ".KQ" if "KOSDAQ" in market else ".KS"
+
+
+# ============================================================
+# Data fetch (Korea)
+# ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fdr_korea_daily(code6: str, start: date, end: date) -> pd.DataFrame:
     if not FDR_OK:
@@ -117,7 +182,7 @@ def fetch_pykrx_daily(code6: str, start: date, end: date, adjusted: bool = True)
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yfinance_korea_daily(code6: str, start: date, end: date, auto_adjust: bool = True, suffix: str = ".KS") -> pd.DataFrame:
+def fetch_yfinance_korea_daily(code6: str, start: date, end: date, auto_adjust: bool, suffix: str) -> pd.DataFrame:
     if not YF_OK:
         return pd.DataFrame()
     try:
@@ -220,11 +285,10 @@ def compute_metrics(equity: pd.Series, strat_ret: pd.Series, trades: pd.DataFram
         "Avg Trade Return": avg_trade,
     }
 
-def run_backtest(df: pd.DataFrame, pos: pd.Series, fee_bps: float = 5.0, slippage_bps: float = 0.0):
+def run_backtest(df: pd.DataFrame, pos: pd.Series, fee_bps: float, slippage_bps: float):
     """
-    NOTE (중요):
-    - 신호(pos)는 '오늘 종가로 계산'했다고 가정하고,
-    - 실제 수익 계산은 pos.shift(1)로 다음 거래일부터 보유한 것으로 처리(룩어헤드 방지).
+    신호(pos)는 오늘 종가로 계산했다고 보고,
+    수익 계산은 pos.shift(1)로 다음 거래일부터 보유(룩어헤드 방지).
     """
     close = df["Close"].astype(float)
     ret = close.pct_change().fillna(0.0)
@@ -405,27 +469,22 @@ def plot_drawdown(equity: pd.Series, title: str):
 
 
 # ============================================================
-# Latest Signal helper (BUY/SELL/HOLD/CASH)
+# Latest Signal helper
 # ============================================================
 def latest_signal_from_pos(pos: pd.Series) -> tuple[str, str]:
-    """
-    Returns (action, detail)
-    action: BUY / SELL / HOLD / CASH
-    detail: short explanation
-    """
     pos = pos.dropna()
     if len(pos) < 2:
-        return "—", "Not enough data to compute signal."
+        return "—", "Not enough data."
     prev_pos = int(pos.iloc[-2])
     last_pos = int(pos.iloc[-1])
 
     if prev_pos == 0 and last_pos == 1:
-        return "BUY", "0→1 (not holding → holding)"
+        return "BUY", "0→1 (현금→보유)"
     if prev_pos == 1 and last_pos == 0:
-        return "SELL", "1→0 (holding → cash)"
+        return "SELL", "1→0 (보유→현금)"
     if last_pos == 1:
-        return "HOLD", "1→1 (keep holding)"
-    return "CASH", "0→0 (stay in cash)"
+        return "HOLD", "1→1 (보유 유지)"
+    return "CASH", "0→0 (현금 유지)"
 
 
 # ============================================================
@@ -441,8 +500,32 @@ with st.sidebar:
         st.success("Cache cleared")
 
     st.divider()
-    st.header("Data (Korea)")
+    st.header("종목 입력")
+    stock_input = st.text_input("6자리 코드 또는 한글 종목명", value="삼성전자")
 
+    code6, chosen_name, candidates = resolve_kr_input_to_code(stock_input)
+
+    if code6 is None:
+        if candidates is None:
+            st.error("종목명 테이블을 만들 수 없습니다. (finance-datareader 또는 pykrx 필요)")
+            st.stop()
+        if candidates.empty:
+            st.error("종목명을 찾지 못했어요. (오타/띄어쓰기 확인)")
+            st.stop()
+
+        if len(candidates) == 1:
+            code6 = candidates.iloc[0]["Symbol"]
+            chosen_name = candidates.iloc[0]["Name"]
+        else:
+            options = (candidates["Symbol"] + " — " + candidates["Name"]).tolist()
+            pick = st.selectbox("검색 결과(여러 개면 선택)", options)
+            code6 = pick.split(" — ")[0].strip()
+            chosen_name = pick.split(" — ")[1].strip()
+
+    listing_df = krx_listing()
+
+    st.divider()
+    st.header("기간")
     today = date.today()
     start_default = today - timedelta(days=365 * 3)
     date_range = st.date_input("Date Range", value=[start_default, today], max_value=today)
@@ -456,6 +539,8 @@ with st.sidebar:
         st.error("Start date must be <= end date.")
         st.stop()
 
+    st.divider()
+    st.header("데이터 소스")
     sources = []
     if PYKRX_OK: sources.append("pykrx (KRX)")
     if FDR_OK: sources.append("FinanceDataReader (KRX)")
@@ -466,20 +551,6 @@ with st.sidebar:
         st.stop()
 
     source = st.selectbox("Data Source", sources)
-
-    listing_df = krx_listing()
-    code6 = st.text_input("KRX Code (6 digits, e.g., 005930)", value="005930").strip()
-    name_q = st.text_input("Search by Name (optional)", value="").strip()
-    chosen_name = None
-
-    if listing_df is not None and name_q:
-        hits = listing_df[listing_df["Name"].astype(str).str.contains(name_q, na=False)].head(30)
-        if len(hits) > 0:
-            opts = (hits["Symbol"].astype(str) + " — " + hits["Name"].astype(str)).tolist()
-            pick = st.selectbox("Matches", opts)
-            code6 = pick.split(" — ")[0].strip()
-            chosen_name = pick.split(" — ")[1].strip()
-
     adjusted = st.checkbox("Adjusted price (if supported)", value=True)
 
     st.divider()
@@ -491,8 +562,7 @@ with st.sidebar:
     mode = st.radio("Mode", ["Single Strategy", "Compare Strategies"], index=0)
 
     st.divider()
-    st.header("Strategy")
-
+    st.header("전략")
     if mode == "Single Strategy":
         strat_name = st.selectbox("Choose Strategy", list(STRATEGIES.keys()))
         st.caption(STRATEGIES[strat_name]["desc"])
@@ -514,7 +584,6 @@ with st.sidebar:
             list(STRATEGIES.keys()),
             default=["Buy & Hold", "SMA Crossover", "MACD Trend", "RSI Mean Reversion"]
         )
-        st.caption("Compare 모드는 각 전략의 기본 파라미터(Defaults)로 비교합니다.")
         strat_name = None
         params = None
 
@@ -522,28 +591,22 @@ with st.sidebar:
     run = st.button("Run", type="primary")
 
 
-def load_korea_data():
-    if not (code6.isdigit() and len(code6) == 6):
-        return pd.DataFrame(), "KR code must be 6 digits"
-
-    display = chosen_name or code6
-
+def load_korea_data(code6_: str):
+    display = chosen_name or code6_
     if source.startswith("pykrx"):
-        df = fetch_pykrx_daily(code6, start_d, end_d, adjusted=adjusted)
-        return df, f"{display} ({code6}) — source=pykrx"
-
+        df = fetch_pykrx_daily(code6_, start_d, end_d, adjusted=adjusted)
+        return df, f"{display} ({code6_}) — pykrx"
     if source.startswith("FinanceDataReader"):
-        df = fetch_fdr_korea_daily(code6, start_d, end_d)
-        return df, f"{display} ({code6}) — source=fdr"
-
+        df = fetch_fdr_korea_daily(code6_, start_d, end_d)
+        return df, f"{display} ({code6_}) — FDR"
     # yfinance
-    # 기본은 KOSPI(.KS)로 두고, 필요하면 코드에서 .KQ로 바꿔서 쓰면 됨
-    df = fetch_yfinance_korea_daily(code6, start_d, end_d, auto_adjust=adjusted, suffix=".KS")
-    return df, f"{display} ({code6}.KS) — source=yfinance"
+    suffix = infer_yahoo_suffix(code6_, listing_df)
+    df = fetch_yfinance_korea_daily(code6_, start_d, end_d, auto_adjust=adjusted, suffix=suffix)
+    return df, f"{display} ({code6_}{suffix}) — yfinance"
 
 
 if run:
-    df, title = load_korea_data()
+    df, title = load_korea_data(code6)
     df = ensure_ohlcv(df)
 
     if df.empty:
@@ -556,10 +619,9 @@ if run:
         fn = STRATEGIES[strat_name]["fn"]
         pos = fn(df, **(params or {}))
 
-        # ✅ Latest Signal 표시
         action, detail = latest_signal_from_pos(pos)
         st.metric("Latest Signal", action)
-        st.caption(f"{detail}  |  (신호는 종가 기준, 실제 체결은 '다음 거래일' 가정)")
+        st.caption(f"{detail} | 신호는 종가 기준, 체결은 다음 거래일 가정")
 
         equity, strat_ret, trades, metrics = run_backtest(df, pos, fee_bps=fee_bps, slippage_bps=slip_bps)
 
@@ -571,16 +633,13 @@ if run:
         c5.metric("Trades", f"{int(metrics.get('Trades', 0)):,}")
 
         tab1, tab2, tab3, tab4 = st.tabs(["Price & Signals", "Equity", "Trades", "Metrics"])
-
         with tab1:
             st_plotly(plot_price_with_signals(df, pos, f"{title} — {strat_name}"), stretch=True)
             with st.expander("Raw data (tail)"):
                 st.dataframe(df.tail(300))
-
         with tab2:
             st_plotly(plot_equity(equity, "Equity Curve (start=1.0)"), stretch=True)
             st_plotly(plot_drawdown(equity, "Drawdown"), stretch=True)
-
         with tab3:
             st.dataframe(trades)
             st.download_button(
@@ -589,11 +648,8 @@ if run:
                 file_name="trades.csv",
                 mime="text/csv",
             )
-
         with tab4:
-            mdf = pd.DataFrame([metrics]).T
-            mdf.columns = ["Value"]
-            st.dataframe(mdf)
+            st.dataframe(pd.DataFrame([metrics]).T.rename(columns={0: "Value"}))
 
     else:
         if not selected:
@@ -605,11 +661,12 @@ if run:
 
         for name in selected:
             fn = STRATEGIES[name]["fn"]
-            pos = fn(df)  # 기본 파라미터
+            pos = fn(df)
+            action, _ = latest_signal_from_pos(pos)
+
             equity, _, _, metrics = run_backtest(df, pos, fee_bps=fee_bps, slippage_bps=slip_bps)
             fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines", name=name))
 
-            action, _ = latest_signal_from_pos(pos)
             row = {"Strategy": name, "Latest Signal": action}
             row.update(metrics)
             results.append(row)
@@ -629,4 +686,4 @@ if run:
         st.dataframe(res_df.sort_values(by=sort_key, ascending=False, na_position="last"))
 
 else:
-    st.info("왼쪽에서 종목/기간/전략을 고르고 **Run**을 누르세요. Single Strategy 모드에서 Latest Signal이 표시됩니다.")
+    st.info("왼쪽에서 종목(한글/코드)과 기간/전략을 고르고 **Run**을 누르세요.")
